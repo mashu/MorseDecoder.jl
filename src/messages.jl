@@ -100,7 +100,7 @@ function random_message(rng::AbstractRNG)
         (:tu,      "R $call2 TU 73"),
     ]
 
-    text, style = rand(rng, patterns)
+    style, text = rand(rng, patterns)   # patterns are (Symbol, String)
     (text, style)
 end
 
