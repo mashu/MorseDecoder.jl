@@ -109,12 +109,14 @@ end
 
 Autoregressive decoder: causal self-attention then cross-attention to encoder memory.
 - `embed`: token embedding
+- `station_embed`: per-station embedding so different stations can produce different outputs (same encoder view).
 - `self_blocks`: causal self-attention
 - `cross_blocks`: cross-attention (q = decoder, k,v = encoder memory)
 - `norm`, `head`: output logits
 """
 struct SpectrogramDecoder
     embed
+    station_embed
     self_blocks
     cross_blocks
     norm
@@ -133,18 +135,20 @@ function SpectrogramDecoder(
     ff_mult::Int = 4,
     norm_eps::Float32 = 1f-5,
     max_len::Int = 2048,
+    max_stations::Int = 5,
 )
     embed = Flux.Embedding(vocab_size => dim)
+    station_embed = Flux.Embedding(max_stations => dim)
     self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramDecoder(embed, self_blocks, cross_blocks, norm, head, rope)
+    SpectrogramDecoder(embed, station_embed, self_blocks, cross_blocks, norm, head, rope)
 end
 
-function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}) where T
-    h = dec.embed(decoder_input_ids)
+function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}, station_ids::AbstractArray{<:Integer,2}) where T
+    h = dec.embed(decoder_input_ids) .+ dec.station_embed(station_ids)
     seq_len = size(h, 2)
     rope_dec = dec.rope[1:seq_len]
     # Self-attn: RoPE on q and k (decoder positions, same length).
@@ -207,7 +211,9 @@ function prepare_decoder_batch(
     decoder_target = ifelse.(decoder_target .== 0, pad_token, decoder_target)
     # (K, B) with [k,b] = k <= n_stations[b], column-major -> (b-1)*K + k
     station_mask = vec(reshape(1:K, :, 1) .<= permutedims(n_stations))
-    (; decoder_input, decoder_target, station_mask)
+    # (1, B*K): column j gets station index 1..K (1-based for Embedding)
+    station_ids = repeat(reshape(1:K, 1, K), 1, B)
+    (; decoder_input, decoder_target, station_mask, station_ids)
 end
 
 """
@@ -247,17 +253,17 @@ end
 # ─── Training step (one batch) ───────────────────────────────────────────────
 
 """
-    prepare_training_batch(batch) -> (spec, decoder_input, decoder_target, station_mask)
+    prepare_training_batch(batch) -> (spec, decoder_input, decoder_target, station_mask, station_ids)
 
 Prepare tensors from a Batch. For CUDA, move each to GPU then call train_step.
 """
 function prepare_training_batch(batch::Batch)
     dec = prepare_decoder_batch(batch.targets, batch.n_stations)
-    (batch.spectrogram, dec.decoder_input, dec.decoder_target, dec.station_mask)
+    (batch.spectrogram, dec.decoder_input, dec.decoder_target, dec.station_mask, dec.station_ids)
 end
 
 """
-    train_step(model, spec, decoder_input, decoder_target, station_mask)
+    train_step(model, spec, decoder_input, decoder_target, station_mask, station_ids)
 
 Single training step. All array arguments must already be on the desired device (e.g. gpu(...)).
 """
@@ -267,11 +273,12 @@ function train_step(
     decoder_input,
     decoder_target,
     station_mask,
+    station_ids,
 )
     memory = model.encoder(spec)
     K = size(decoder_input, 2) ÷ size(memory, 3)
     memory_rep = repeat_memory_for_stations(memory, K)
-    logits = model.decoder(decoder_input, memory_rep)
+    logits = model.decoder(decoder_input, memory_rep, station_ids)
     multi_station_cross_entropy(logits, decoder_target, station_mask)
 end
 
@@ -281,12 +288,11 @@ train_step(model::SpectrogramEncoderDecoder, batch::Batch) =
 # ─── Autoregressive sampling ───────────────────────────────────────────────────
 
 """
-    decode_autoregressive(model, spec, n_stations; max_len, start_token)
+    decode_autoregressive(model, spec, n_stations; max_len, start_token, to_device)
 
-Decode up to `n_stations` transcripts from one spectrogram. Caller moves `spec` to GPU if needed.
-Returns a matrix (max_len, n_stations) of token indices. Keeps ids on the same device as `spec`
-so the loop stays on GPU; only the small logits slice is copied to CPU for argmax (CuArray argmax
-uses a reduction that does not compile on CUDA).
+Decode up to `n_stations` transcripts from one spectrogram. No mutations: buffers are created
+via to_device (e.g. pass to_device=gpu so ids stay on GPU). Returns (max_len, n_stations) token indices.
+to_device(x) should place x on the same device as spec (e.g. Flux.gpu or Flux.cpu); default identity.
 """
 function decode_autoregressive(
     model::SpectrogramEncoderDecoder,
@@ -294,20 +300,22 @@ function decode_autoregressive(
     n_stations::Int;
     max_len::Int = 256,
     start_token::Int = START_TOKEN_IDX,
+    to_device = identity,
 )
     memory = model.encoder(spec)
     memory_rep = repeat_memory_for_stations(memory, n_stations)
-    # Same device as spec (GPU or CPU) so no repeated transfers in the loop
-    ids_so_far = fill!(similar(spec, Int, 1, n_stations), start_token)
+    # Pure: create on CPU then place on device via to_device (no fill!/copyto!)
+    station_ids = to_device(reshape(collect(1:n_stations), 1, n_stations))
+    ids_so_far = to_device(fill(start_token, 1, n_stations))
 
     for _ in 2:max_len
-        logits = model.decoder(ids_so_far, memory_rep)
+        logits = model.decoder(ids_so_far, memory_rep, station_ids)
         next_logits = selectdim(logits, 2, size(logits, 2))
-        # argmax on CuArray triggers invalid LLVM IR; copy slice to CPU, argmax, then copy indices back
+        # argmax on CuArray triggers invalid LLVM IR; copy slice to CPU, argmax, then back via to_device
         next_logits_cpu = Array(next_logits)
         am = argmax(next_logits_cpu; dims=1)
         next_ids_cpu = reshape(map(i -> i[1], am), 1, n_stations)
-        next_ids = copyto!(similar(spec, Int, 1, n_stations), next_ids_cpu)
+        next_ids = to_device(next_ids_cpu)
         ids_so_far = cat(ids_so_far, next_ids; dims=1)
     end
 
