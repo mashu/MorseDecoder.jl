@@ -1,35 +1,41 @@
 """
     messages.jl — Random callsign + exchange text generators.
 
-Produces realistic CW contest/QSO text for training data.  Kept deliberately
-simple — a handful of patterns covers the distribution well enough for the
-decoder to learn.
+Produces diverse CW contest/QSO and report-exchange text for training.
+Many patterns and variants so the decoder sees a wide distribution.
 """
 
 # ─── Callsigns ───────────────────────────────────────────────────────────────
 
 const PREFIXES = [
-    "W", "K", "N", "AA", "KD",          # USA
-    "VE", "VA",                           # Canada
-    "DL", "DK", "DJ",                     # Germany
-    "JA", "JH",                           # Japan
-    "G", "M",                             # UK
-    "F",                                  # France
-    "SP", "SQ",                           # Poland
-    "UA", "RA",                           # Russia
-    "I", "IK",                            # Italy
-    "EA",                                 # Spain
-    "SM", "SA",                           # Sweden
-    "OH",                                 # Finland
-    "VK",                                 # Australia
-    "PY",                                 # Brazil
-    "OK",                                 # Czech Republic
+    "W", "K", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "KD", "KE", "KF",
+    "VE", "VA", "VO", "VY",
+    "DL", "DK", "DJ", "DM", "DO", "DP",
+    "JA", "JH", "JI", "JJ", "JK", "JL", "JM", "JN", "JO", "JP", "JR", "JS", "JT", "JU", "JV", "JW", "JY",
+    "G", "M", "GM", "MM", "GW", "MW",
+    "F", "FW", "TM",
+    "SP", "SQ", "SR", "SO", "SN", "HF",
+    "UA", "RA", "UA9", "RA9", "RZ", "RW",
+    "I", "IK", "IW", "IM",
+    "EA", "EB", "EC", "ED", "EE", "EF",
+    "SM", "SA", "SK", "SG", "7S",
+    "OH", "OF", "OG", "OI",
+    "VK", "VL", "VM", "VN",
+    "PY", "PP", "PU", "PV",
+    "OK", "OL", "OM", "OZ",
+    "HA", "HG", "HI", "HK",
+    "LY", "LY2", "LX",
+    "S5", "S5", "S5",
+    "CT", "CS", "CU",
+    "YB", "YC", "YD", "YE", "YF", "YG", "YH",
+    "ZL", "ZM", "ZK",
+    "ZS", "ZR", "ZU", "ZV", "ZW",
 ]
 
-"""Generate a realistic amateur callsign."""
+"""Generate a realistic amateur callsign (A-Z, 0-9 only; no / so alphabet stays simple)."""
 function random_callsign(rng::AbstractRNG)
     pre    = rand(rng, PREFIXES)
-    digit  = rand(rng, 1:9)
+    digit  = rand(rng, 0:9)
     suffix = String(rand(rng, 'A':'Z', rand(rng, 1:3)))
     "$pre$digit$suffix"
 end
@@ -38,17 +44,33 @@ end
 
 const CUT_MAP = Dict('0'=>'T', '9'=>'N', '1'=>'A', '5'=>'E')
 
-"""Random RST (usually 599, occasionally weaker)."""
+"""Random RST (often 599/5NN, sometimes weaker or different formats)."""
 function random_rst(rng::AbstractRNG)
-    rst = rand(rng) < 0.85 ? "599" : rand(rng, ["589","579","559","549","539"])
-    # Maybe apply cut numbers (contest shorthand: 5NN = 599)
-    String([get(CUT_MAP, c, c) for c in rst if rand(rng) < 0.4 || !haskey(CUT_MAP, c)])
+    rst = rand(rng, [
+        "599", "599", "599", "5NN", "5NN",
+        "589", "579", "559", "549", "539", "529",
+        "339", "449", "469", "479", "489",
+        "229", "339", "459",
+    ])
+    # Sometimes use cut numbers (5NN, 5TT, etc.)
+    String([get(CUT_MAP, c, c) for c in rst if rand(rng) < 0.35 || !haskey(CUT_MAP, c)])
 end
 
-"""Random serial number (1–2000), optionally zero-padded."""
+"""Random serial number (1–9999), various padding styles."""
 function random_serial(rng::AbstractRNG)
-    n = rand(rng, 1:2000)
-    rand(rng) < 0.5 ? string(n) : lpad(n, 3, '0')
+    n = rand(rng, 1:9999)
+    rand(rng, [
+        string(n),
+        lpad(n, 3, '0'),
+        lpad(n, 4, '0'),
+        n <= 999 ? string(n) : lpad(n, 4, '0'),
+    ])
+end
+
+"""Random short serial (1–99) for quick exchanges."""
+function random_serial_short(rng::AbstractRNG)
+    n = rand(rng, 1:99)
+    rand(rng) < 0.5 ? string(n) : lpad(n, 2, '0')
 end
 
 # ─── Exchange patterns ───────────────────────────────────────────────────────
@@ -61,46 +83,112 @@ const STATES = ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID",
 const OP_NAMES = ["JOHN","MIKE","BOB","DAVE","JIM","TOM","BILL","STEVE",
     "RICK","DAN","MARK","PAUL","GARY","JEFF","JACK","FRED","PETER","RON",
     "YURI","IGOR","HANS","LARS","KARL","PEDRO","MARCO","TIMO","MATTI",
-    "OLEG","ALEX","MAREK","ADAM","TAKASHI","VLAD","DMITRI"]
+    "OLEG","ALEX","MAREK","ADAM","TAKASHI","VLAD","DMITRI","ANNA","MARIA",
+    "LISA","SOPHIE","ELENA","KATE","JULIA","NINA"]
 
 const QTH_POOL = ["STOCKHOLM","WARSAW","BERLIN","LONDON","PARIS","TOKYO",
     "MOSCOW","ROME","MADRID","PRAGUE","VIENNA","OSLO","HELSINKI","CHICAGO",
-    "NEW YORK","KRAKOW","WROCLAW","POZNAN","GOETEBORG","MALMO"]
+    "NEW YORK","KRAKOW","WROCLAW","POZNAN","GOETEBORG","MALMO","GDANSK",
+    "LODZ","SZCZECIN","BUDAPEST","BRATISLAVA","ZAGREB","BUCHAREST","SOFIA",
+    "ATHENS","LISBON","DUBLIN","AMSTERDAM","BRUSSELS","COPENHAGEN"]
+
+const ZONES = 1:40   # CQ zones
 
 """
     random_message(rng) → (text::String, style::Symbol)
 
-Generate a random CW message from one of several contest/QSO patterns.
-Returns the text and a label for the exchange style.
+Generate a random CW message from a large set of contest/QSO and report-exchange patterns.
+Returns the text and a style label for diversity.
 """
 function random_message(rng::AbstractRNG)
     call1 = random_callsign(rng)
     call2 = random_callsign(rng)
     rst   = random_rst(rng)
+    zone  = lpad(rand(rng, ZONES), 2, '0')
+    ser   = random_serial(rng)
+    ser_s = random_serial_short(rng)
+    name  = rand(rng, OP_NAMES)
+    state = rand(rng, STATES)
+    qth   = rand(rng, QTH_POOL)
 
     patterns = [
-        # CQ call
+        # CQ variants
         (:cq,      "CQ CQ $call1 $call1 K"),
+        (:cq,      "CQ CQ CQ $call1 K"),
         (:cq,      "CQ TEST $call1 $call1"),
-        # CQ WW — RST + zone
-        (:cqww,    "$call2 $rst $(lpad(rand(rng,1:40),2,'0'))"),
-        (:cqww,    "$rst $(lpad(rand(rng,1:40),2,'0')) $call1"),
-        # WPX — RST + serial
-        (:wpx,     "$call2 $rst $(random_serial(rng))"),
-        (:wpx,     "NR $(random_serial(rng)) $(random_serial(rng))"),
-        # Sprint — serial + name + state
-        (:sprint,  "$call2 $call1 $(random_serial(rng)) $(rand(rng,OP_NAMES)) $(rand(rng,STATES))"),
-        (:sprint,  "$(random_serial(rng)) $(rand(rng,OP_NAMES)) $(rand(rng,STATES))"),
-        # General QSO
+        (:cq,      "CQ DX $call1 $call1 K"),
+        (:cq,      "CQ CONTEST $call1 K"),
+        (:cq,      "CQ $call1 $call1 DE $call1 K"),
+        (:cq,      "CQ CQ DE $call1 $call1 $call1 K"),
+        # Report-only / minimal
+        (:report,  "$rst $ser"),
+        (:report,  "$rst $zone"),
+        (:report,  "$rst $zone $call1"),
+        (:report,  "5NN $ser"),
+        (:report,  "599 $(random_serial(rng))"),
+        (:report,  "R $rst"),
+        (:report,  "R $rst $call1"),
+        (:report,  "NR $ser"),
+        (:report,  "$ser $rst"),
+        (:report,  "$zone $rst"),
+        (:report,  "$ser"),
+        (:report,  "TU $rst"),
+        (:report,  "TU $rst $call1"),
+        (:report,  "R $call2 TU $rst"),
+        (:report,  "73"),
+        (:report,  "73 DE $call1"),
+        (:report,  "73 DE $call1 SK"),
+        (:report,  "BK"),
+        (:report,  "K"),
+        # CQ WW style — RST + zone
+        (:cqww,    "$call2 $rst $zone"),
+        (:cqww,    "$rst $zone $call1"),
+        (:cqww,    "$call1 $call2 $rst $zone"),
+        (:cqww,    "$call2 DE $call1 $rst $zone"),
+        (:cqww,    "$call1 $rst $zone"),
+        (:cqww,    "5NN $zone $call1"),
+        # WPX / serial contests
+        (:wpx,     "$call2 $rst $ser"),
+        (:wpx,     "$call1 $call2 $rst $ser"),
+        (:wpx,     "NR $ser $ser"),
+        (:wpx,     "$rst $ser"),
+        (:wpx,     "$call2 NR $ser"),
+        (:wpx,     "$ser $rst $call1"),
+        # ARRL Field Day / Sprint — serial + name + state/entity
+        (:sprint,  "$call2 $call1 $ser $name $state"),
+        (:sprint,  "$ser $name $state"),
+        (:sprint,  "$call1 $call2 $ser $name $state"),
+        (:sprint,  "$call2 $ser $name $state"),
+        (:sprint,  "$ser $name $qth"),
+        (:sprint,  "$name $state $ser"),
+        (:sprint,  "$call1 $ser $name $state"),
+        # Full QSO / ragchew
         (:qso,     "CQ CQ CQ DE $call1 $call1 $call1 K"),
-        (:qso,     "$call1 DE $call2 UR RST $rst NAME $(rand(rng,OP_NAMES)) QTH $(rand(rng,QTH_POOL)) K"),
+        (:qso,     "$call1 DE $call2 K"),
+        (:qso,     "$call1 DE $call2 UR RST $rst NAME $name QTH $qth K"),
+        (:qso,     "$call1 DE $call2 RST $rst $rst NAME $name $name QTH $state K"),
+        (:qso,     "$call2 DE $call1 GM UR $rst $rst TNX QSO 73"),
         (:qso,     "73 DE $call1 SK"),
-        # Confirmation
+        (:qso,     "73 GL DE $call1 SK"),
+        (:qso,     "TU $call2 73 DE $call1"),
+        (:qso,     "DE $call1 $call1 K"),
+        (:qso,     "$call1 $call2 R $rst 73"),
+        # Short confirmations / fill-ins
         (:tu,      "TU $rst $call1"),
         (:tu,      "R $call2 TU 73"),
+        (:tu,      "TU $ser"),
+        (:tu,      "R $rst TU"),
+        (:tu,      "CFM $rst $call1"),
+        (:tu,      "QSL $rst"),
+        (:tu,      "OK $call2 $rst"),
+        # DE / reply starts (no CQ)
+        (:reply,   "DE $call1 $call1 K"),
+        (:reply,   "$call2 DE $call1 $rst $zone"),
+        (:reply,   "$call1 DE $call2 $rst $ser"),
+        (:reply,   "DE $call1 $call2 $rst"),
     ]
 
-    style, text = rand(rng, patterns)   # patterns are (Symbol, String)
+    style, text = rand(rng, patterns)
     (text, style)
 end
 

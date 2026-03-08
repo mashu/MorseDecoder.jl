@@ -68,25 +68,30 @@ end
 
 const CHUNK_FRAMES = 4
 
-"""Run decode on one spectrogram, n_stations outputs; print raw first 8 tokens and decoded string."""
+"""Run decode on one spectrogram, n_stations outputs; print ground truth and decoded text for comparison."""
 function run_decode_test(model, batch, device; n_stations::Int=2, max_len::Int=32)
     test_spec = batch.spectrogram[:, 1:1, :]
     test_spec = device(test_spec)
     ids = decode_autoregressive(model, test_spec, n_stations; max_len, to_device=device)
     ids_cpu = cpu(ids)
-    for k in 1:n_stations
+    n_stations_actual = min(n_stations, size(batch.targets, 2))
+    for k in 1:n_stations_actual
+        # Ground truth from batch (first sample, station k; targets are zero-padded)
+        truth_ids = batch.targets[1, k, :]
+        truth_s = token_ids_to_string(truth_ids)
+        # Model decode
         seq = [ids_cpu[i, k] for i in 1:size(ids_cpu, 1)]
-        println("    station $k (raw first 8): ", Int.(seq[1:min(8, end)]))
-        s = token_ids_to_string(seq)
-        println("    station $k: ", isempty(s) ? "(empty)" : s)
+        decode_s = token_ids_to_string(seq)
+        println("    station $k  truth: ", isempty(truth_s) ? "(empty)" : truth_s)
+        println("    station $k  decode: ", isempty(decode_s) ? "(empty)" : decode_s)
     end
 end
 
-"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, BLANK→space, stop at PAD/START."""
+"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, BLANK→space, stop at PAD/START/0."""
 function token_ids_to_string(ids::AbstractVector{<:Integer})
     buf = Char[]
     for i in ids
-        i == PAD_TOKEN_IDX && break
+        (i == PAD_TOKEN_IDX || i == 0) && break
         i == START_TOKEN_IDX && continue
         if 1 <= i <= NUM_CHARS
             push!(buf, IDX_TO_CHAR[i])
