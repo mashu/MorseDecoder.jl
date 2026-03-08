@@ -56,6 +56,7 @@ include("messages.jl")        # callsigns, exchange text
 include("band.jl")            # multi-station mixing
 include("sampler.jl")         # training data + streaming
 include("viz.jl")             # plots
+include("model.jl")           # encoder–decoder (Onion + Flux)
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
@@ -84,6 +85,12 @@ export
     StationStream, BandStream, next_chunk!, reset!,
 
     # Visualization
-    plot_spectrogram, plot_band, plot_chunk
+    plot_spectrogram, plot_band, plot_chunk,
+
+    # Model (requires Flux, Onion, Einops)
+    SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
+    prepare_decoder_batch, prepare_training_batch, train_step,
+    decode_autoregressive, multi_station_cross_entropy,
+    VOCAB_SIZE, START_TOKEN_IDX, PAD_TOKEN_IDX
 
 end # module MorseDecoder
