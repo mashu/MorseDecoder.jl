@@ -1,63 +1,89 @@
 """
     MorseDecoder
 
-Morse data pipeline: simulation, spectrogram, WAV I/O, dataset generation.
-No neural network model — data exploration and preprocessing only; modeling lives in the notebook.
+Multi-station Morse code simulation and training data pipeline.
+
+Simulates 1–N CW stations transmitting simultaneously in the 200–800 Hz
+band, produces spectrograms as network input, and provides a real-time
+streaming interface.  Designed for training an encoder–decoder transformer
+that decodes multiple overlapping Morse signals.
+
+# Quick start
+
+```julia
+using MorseDecoder, Random
+
+rng = MersenneTwister(42)
+
+# One-shot sample
+cfg = SamplerConfig(n_stations_range=1:3)
+s   = generate_sample(cfg; rng)           # → Sample (spectrogram + texts)
+
+# Training batch
+batch = generate_batch(cfg, 32; rng)      # → Batch (padded tensors)
+
+# Streaming (live band simulation)
+stations = [Station(frequency=f, wpm=25) for f in [350, 550, 700]]
+stream   = BandStream(stations; rng)
+spec, texts = next_chunk!(stream, 16_000) # 2 seconds @ 8 kHz
+
+# Visualization
+scene = random_band(rng; n_stations=3)
+plot_band(scene, SpectrogramConfig())
+```
 
 # Layout
-- **alphabet**     — Morse table, character ↔ index
-- **audio/**       — spectrogram (CPU), WAV I/O, visualization
-- **simulation/**  — types, simulator, contests, drift (Morse signal generation)
-- **data/**        — dataset manifest, generation, loading
+- `morse.jl`       — Morse table, character ↔ index, keying envelope
+- `spectrogram.jl` — Short-time FFT → power spectrogram
+- `signal.jl`      — Single-station audio synthesis
+- `messages.jl`    — Callsign + exchange text generators
+- `band.jl`        — Multi-station mixing
+- `sampler.jl`     — Training samples, batch collation, BandStream
+- `viz.jl`         — CairoMakie plots
 """
-
 module MorseDecoder
 
 using Random
-using Statistics
-using DSP
-using AbstractFFTs: rfft
-using FFTW
+using FFTW: rfft
 using CairoMakie
 
-# ── Shared ───────────────────────────────────────────────────────────────────
-include("alphabet.jl")
+# ── Source files (order matters) ─────────────────────────────────────────────
 
-# ── Audio ─────────────────────────────────────────────────────────────────────
-include("audio/spectrogram.jl")
-include("audio/wav.jl")
-
-# ── Simulation ───────────────────────────────────────────────────────────────
-include("simulation/types.jl")
-include("simulation/simulator.jl")
-include("simulation/callsigns.jl")
-include("simulation/contests.jl")
-include("simulation/drift.jl")
-
-# ── Data ─────────────────────────────────────────────────────────────────────
-include("data/dataset.jl")
-
-# ── Audio visualization ──────────────────────────────────────────────────────
-include("audio/visualization.jl")
+include("morse.jl")           # alphabet, keying envelope
+include("spectrogram.jl")     # STFT
+include("signal.jl")          # Station, synthesize
+include("messages.jl")        # callsigns, exchange text
+include("band.jl")            # multi-station mixing
+include("sampler.jl")         # training data + streaming
+include("viz.jl")             # plots
 
 # ── Public API ───────────────────────────────────────────────────────────────
+
 export
-    MORSE_TABLE, ALPHABET, NUM_CHARS, NUM_TAGS, CHAR_TO_IDX, IDX_TO_CHAR,
-    Modulation, NoiseModel, KeyingStyle,
-    SineModulation, WhiteGaussianNoise, NoNoise,
-    HumanKeying, PerfectKeying, DriftingKeying,
-    MorseSignalConfig, MorseSignal,
-    generate_signal, random_config, random_morse_text,
-    MorseFFTConfig, audio_to_tokens, n_bins, bin_range, compute_spectrogram,
-    random_callsign, PrefixDef, PREFIX_POOL,
-    AbstractContest, ContestExchange,
-    CQWorldWide, CQWPX, ARRLDX, ARRLSweepstakes, Sprint, GeneralQSO, IARUHF,
-    generate_exchange, random_exchange,
-    generate_contest_signal, sample_word_wpms,
-    DatasetConfig, generate_dataset, load_dataset, DatasetLoader, num_freq_bins,
-    load_sample, load_batch, random_training_batch, collate_batch,
-    write_wav, read_wav, ManifestEntry, dataset_stats,
-    read_manifest, write_manifest,
-    plot_waveform
+    # Morse alphabet
+    MORSE_TABLE, ALPHABET, NUM_CHARS, BLANK_TOKEN,
+    CHAR_TO_IDX, IDX_TO_CHAR, encode_text, decode_indices,
+
+    # Spectrogram
+    SpectrogramConfig, compute_spectrogram, num_bins, num_frames,
+
+    # Station & signal
+    Station, synthesize,
+
+    # Messages
+    random_callsign, random_message, random_text,
+
+    # Band mixing
+    BandScene, mix_stations, random_band,
+
+    # Sampler
+    Sample, SamplerConfig, generate_sample,
+    Batch, collate, generate_batch,
+
+    # Streaming
+    StationStream, BandStream, next_chunk!, reset!,
+
+    # Visualization
+    plot_spectrogram, plot_band, plot_chunk
 
 end # module MorseDecoder
