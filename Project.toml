@@ -4,6 +4,7 @@ authors = ["Mateusz Kaduk <mateusz.kaduk@gmail.com>"]
 version = "0.2.0"
 
 [deps]
+ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Einops = "e3ce28c8-8bfb-4704-8add-e3e7f14b55c9"
@@ -16,6 +17,7 @@ WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
+ArgParse = "1.2.0"
 CUDA = "5.9.7"
 JLD2 = "0.6.3"
 Onion = "0.2.18"

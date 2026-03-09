@@ -1,62 +1,94 @@
 #!/usr/bin/env julia
 # Train the spectrogram encoder–decoder. Run from repo root:
-#   julia --project=. examples/train.jl [--gpu] [--steps 10000] [--batch 32] [--accum 1]
-#   [--checkpoint-dir checkpoints] [--save-every 1000] [--prefetch 4] [--lr 1e-4]
-#   [--decode-every 100]  decode on fixed validation spectrogram every N steps (0 = only at end)
-#   [--dim 128] [--n-layers 5] [--n-heads 4]  smaller dim ok; n_layers >= 5 for RoPE
-#
-# Uses MorseDecoder sampler for batches. For GPU: pass --gpu; use --batch to fill the GPU
-# and --accum for gradient accumulation (effective batch = batch * accum).
-# Checkpoints (model + optimiser state, on CPU) are saved every --save-every steps; if
-# checkpoint_latest.jld2 exists in --checkpoint-dir, training resumes from it on GPU.
-# --prefetch N: producer task pre-generates up to N batches so GPU is not waiting on data.
+#   julia --project=. examples/train.jl [options]
+# Use --help for full list and defaults.
 
+using ArgParse
+using Logging
 using MorseDecoder
 using Flux
 using Random
 using CUDA
 using cuDNN
 using JLD2
+using ChainRulesCore
 
-function parse_args()
-    gpu = "--gpu" in ARGS
-    steps = 10_000
-    batch_size = gpu ? 32 : 8
-    accum_steps = 1
-    checkpoint_dir = "checkpoints"
-    save_every = 1000
-    prefetch = 4
-    lr = 1f-4
-    decode_every = 0
-    dim = 128
-    n_layers = 5   # at least 5 for RoPE
-    n_heads = 4
-    for i in eachindex(ARGS)
-        if ARGS[i] == "--steps" && i < length(ARGS)
-            steps = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--batch" && i < length(ARGS)
-            batch_size = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--accum" && i < length(ARGS)
-            accum_steps = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--checkpoint-dir" && i < length(ARGS)
-            checkpoint_dir = ARGS[i + 1]
-        elseif ARGS[i] == "--save-every" && i < length(ARGS)
-            save_every = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--prefetch" && i < length(ARGS)
-            prefetch = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--lr" && i < length(ARGS)
-            lr = parse(Float32, ARGS[i + 1])
-        elseif ARGS[i] == "--decode-every" && i < length(ARGS)
-            decode_every = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--dim" && i < length(ARGS)
-            dim = parse(Int, ARGS[i + 1])
-        elseif ARGS[i] == "--n-layers" && i < length(ARGS)
-            n_layers = max(5, parse(Int, ARGS[i + 1]))  # minimum 5 for RoPE
-        elseif ARGS[i] == "--n-heads" && i < length(ARGS)
-            n_heads = parse(Int, ARGS[i + 1])
-        end
+# Multi-step gradient accumulation: sum grads over N steps then one optimizer update.
+# Uses ChainRulesCore.add!! for in-place accumulation when possible (AD-agnostic).
+# Not the same as Zygote.checkpointed (that is gradient checkpointing for memory).
+accum_grad(a::AbstractArray{T,N}, b::AbstractArray{T,N}) where {T,N} = add!!(a, b)
+accum_grad(a::N, b::N) where N<:Number = add!!(a, b)
+accum_grad(a, b) = a  # fallback for Nothing / other leaf types
+
+function parse_commandline()
+    s = ArgParseSettings(
+        description = "Train spectrogram encoder–decoder for multi-station Morse. Checkpoints (model + optimiser) saved in checkpoint-dir; resume by re-running with same dir.",
+        version = "train.jl 0.1",
+        add_version = true,
+    )
+    @add_arg_table! s begin
+        "--gpu"
+        help = "Use GPU (CUDA) for training and decode"
+        action = :store_true
+        "--steps"
+        help = "Number of training steps"
+        arg_type = Int
+        default = 100_000
+        "--batch"
+        help = "Batch size (default 64 with --gpu; use 8 for CPU)"
+        arg_type = Int
+        default = 64
+        "--accum"
+        help = "Gradient accumulation steps (effective batch = batch × accum)"
+        arg_type = Int
+        default = 1
+        "--checkpoint-dir"
+        help = "Directory for checkpoint_latest.jld2"
+        arg_type = String
+        default = "checkpoints"
+        "--save-every"
+        help = "Save checkpoint every N steps"
+        arg_type = Int
+        default = 500
+        "--prefetch"
+        help = "Number of batches to pre-generate (0 = no prefetch)"
+        arg_type = Int
+        default = 128
+        "--lr"
+        help = "Learning rate"
+        arg_type = Float32
+        default = 1f-5
+        "--decode-every"
+        help = "Run decode on fixed val every N steps (0 = only at end)"
+        arg_type = Int
+        default = 500
+        "--dim"
+        help = "Model dimension (encoder and decoder)"
+        arg_type = Int
+        default = 64
+        "--n-layers"
+        help = "Number of encoder/decoder layers (min 5 for RoPE)"
+        arg_type = Int
+        default = 6
+        "--n-heads"
+        help = "Number of attention heads"
+        arg_type = Int
+        default = 4
+        "--teacher-forcing-prob"
+        help = "Prob of using ground truth as decoder input (1.0 = always; 0.9 = 90% GT, 10% random). Reduces exposure bias."
+        arg_type = Float64
+        default = 0.9
     end
-    (; gpu, steps, batch_size, accum_steps, checkpoint_dir, save_every, prefetch, lr, decode_every, dim, n_layers, n_heads)
+    parsed = ArgParse.parse_args(ARGS, s)
+    # CPU: default batch 8 if user did not pass --batch (parser default is 64)
+    batch_size = parsed["gpu"] ? parsed["batch"] : (parsed["batch"] == 64 ? 8 : parsed["batch"])
+    n_layers = max(5, parsed["n-layers"])
+    (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
+      accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
+      save_every = parsed["save-every"], prefetch = parsed["prefetch"],
+      lr = parsed["lr"], decode_every = parsed["decode-every"],
+      dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
+      teacher_forcing_prob = parsed["teacher-forcing-prob"])
 end
 
 function build_model(n_bins::Int, chunk_frames::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
@@ -70,20 +102,29 @@ const CHUNK_FRAMES = 4
 
 """Run decode on one spectrogram, n_stations outputs; print ground truth and decoded text for comparison."""
 function run_decode_test(model, batch, device; n_stations::Int=2, max_len::Int=32)
+    _run_decode_one(model, batch, device, n_stations, max_len)
+end
+
+"""Run decode on each of several batches (e.g. different val seeds) to see if output varies with input."""
+function run_decode_test(model, batches::AbstractVector, device; n_stations::Int=2, max_len::Int=32)
+    for (i, batch) in enumerate(batches)
+        @info "val sample" sample=i
+        _run_decode_one(model, batch, device, n_stations, max_len)
+    end
+end
+
+function _run_decode_one(model, batch, device, n_stations, max_len)
     test_spec = batch.spectrogram[:, 1:1, :]
     test_spec = device(test_spec)
     ids = decode_autoregressive(model, test_spec, n_stations; max_len, to_device=device)
     ids_cpu = cpu(ids)
     n_stations_actual = min(n_stations, size(batch.targets, 2))
     for k in 1:n_stations_actual
-        # Ground truth from batch (first sample, station k; targets are zero-padded)
         truth_ids = batch.targets[1, k, :]
         truth_s = token_ids_to_string(truth_ids)
-        # Model decode
         seq = [ids_cpu[i, k] for i in 1:size(ids_cpu, 1)]
         decode_s = token_ids_to_string(seq)
-        println("    station $k  truth: ", isempty(truth_s) ? "(empty)" : truth_s)
-        println("    station $k  decode: ", isempty(decode_s) ? "(empty)" : decode_s)
+        @info "station" station=k truth=(isempty(truth_s) ? "(empty)" : truth_s) decode=(isempty(decode_s) ? "(empty)" : decode_s)
     end
 end
 
@@ -102,25 +143,34 @@ function token_ids_to_string(ids::AbstractVector{<:Integer})
     String(buf)
 end
 
-function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt)
+function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, n_layers::Int, n_heads::Int)
     mkpath(dirname(path))
     model_cpu = cpu(model)
     opt_cpu = cpu(opt)
     model_state = Flux.state(model_cpu)
-    jldsave(path; step, n_bins, chunk_frames=CHUNK_FRAMES, model_state, optimiser_state=opt_cpu)
-    println("  checkpoint saved at step $step -> $path")
+    jldsave(path; step, n_bins, chunk_frames=CHUNK_FRAMES, dim, n_layers, n_heads,
+            model_state, optimiser_state=opt_cpu)
+    @info "checkpoint saved" step=step path=path
 end
 
 function load_checkpoint(path::String)
     isfile(path) || return nothing
     jldopen(path, "r") do f
-        (; step = f["step"], n_bins = f["n_bins"], chunk_frames = f["chunk_frames"],
-          model_state = f["model_state"], optimiser_state = f["optimiser_state"])
+        step = f["step"]
+        n_bins = f["n_bins"]
+        chunk_frames = f["chunk_frames"]
+        model_state = f["model_state"]
+        optimiser_state = f["optimiser_state"]
+        # Architecture: use saved so resume matches; old checkpoints may not have these
+        dim = haskey(f, "dim") ? f["dim"] : nothing
+        n_layers = haskey(f, "n_layers") ? f["n_layers"] : nothing
+        n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
+        (; step, n_bins, chunk_frames, model_state, optimiser_state, dim, n_layers, n_heads)
     end
 end
 
 function main()
-    args = parse_args()
+    args = parse_commandline()
     rng = MersenneTwister(42)
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
@@ -133,16 +183,24 @@ function main()
     loaded = load_checkpoint(checkpoint_path)
     step_start = 1
     if loaded !== nothing
-        (; step, n_bins, chunk_frames, model_state, optimiser_state) = loaded
-        step_start = step + 1
-        model = build_model(n_bins, chunk_frames; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
+        d = loaded
+        step_start = d.step + 1
+        # Use saved architecture so weights match; fall back to args for old checkpoints
+        dim = something(get(d, :dim, nothing), args.dim)
+        n_layers = something(get(d, :n_layers, nothing), args.n_layers)
+        n_heads = something(get(d, :n_heads, nothing), args.n_heads)
+        n_bins = d.n_bins
+        chunk_frames = d.chunk_frames
+        model_state = d.model_state
+        optimiser_state = d.optimiser_state
+        model = build_model(n_bins, chunk_frames; dim, n_heads, n_layers)
         Flux.loadmodel!(model, model_state)
         opt = optimiser_state
         if args.gpu
             model = device(model)
             opt = device(opt)
         end
-        println("Resumed from $checkpoint_path (step $step -> continuing from $step_start)")
+        @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim n_layers=n_layers n_heads=n_heads
     else
         model = build_model(n_bins, CHUNK_FRAMES; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
         if args.gpu
@@ -152,12 +210,11 @@ function main()
     end
 
     effective_batch = args.batch_size * args.accum_steps
-    # Fixed validation batch for decode (same inputs every time so we see real progress)
-    rng_val = MersenneTwister(123)
-    val_batch = generate_batch(cfg, 1; rng=rng_val)
-    n_val_stations = min(2, maximum(val_batch.n_stations))
+    # Several fixed validation batches (different seeds) so we see if decode varies with input
+    val_batches = [generate_batch(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
+    n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    println("Training for $(args.steps) steps on $(args.gpu ? "GPU" : "CPU") (batch=$(args.batch_size), accum=$(args.accum_steps), effective_batch=$effective_batch, dim=$(args.dim), n_layers=$(args.n_layers), lr=$(args.lr), save_every=$(args.save_every), prefetch=$(args.prefetch)$(args.decode_every > 0 ? ", decode_every=$(args.decode_every) on fixed val" : ""))")
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr save_every=args.save_every prefetch=args.prefetch decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
 
     # Prefetched batch producer: fills channel so GPU doesn't wait on data
     batch_channel = nothing
@@ -188,18 +245,28 @@ function main()
         station_mask = device(station_mask)
         station_ids = device(station_ids)
 
-        args.gpu && CUDA.synchronize()
+        # Scheduled-sampling style: with prob (1 - teacher_forcing_prob) replace decoder input (except START) with random token so model learns to use encoder when prefix is wrong
+        if args.teacher_forcing_prob < 1
+            noise_prob = 1.0 - args.teacher_forcing_prob
+            L, Bk = size(decoder_input)
+            noise_mask = rand(rng, L, Bk) .< noise_prob
+            noise_mask[1, :] .= false   # keep START
+            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
+            random_tokens = device(random_tokens)
+            noise_mask = device(noise_mask)
+            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
+        end
+
         t_step = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / Float32(args.accum_steps)
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
         end
-        args.gpu && CUDA.synchronize()
         loss_sum += result.val * args.accum_steps
 
         if grads_accum === nothing
             grads_accum = result.grad[1]
         else
-            grads_accum = Flux.fmap((a, b) -> a isa AbstractArray ? a .+ b : (a isa Number && b isa Number ? a + b : a), grads_accum, result.grad[1])
+            grads_accum = Flux.fmap(accum_grad, grads_accum, result.grad[1])
         end
         accum_count += 1
 
@@ -212,14 +279,14 @@ function main()
             if step % 50 == 0
                 elapsed_total = time() - t0
                 steps_per_sec = (step - step_start + 1) / max(elapsed_total, 1e-9)
-                println("  step $step  loss = $(round(loss_avg; digits=4))  ($(round(steps_per_sec; digits=2)) steps/s)")
+                @info "step" step=step loss=round(loss_avg; digits=4) steps_per_sec=round(steps_per_sec; digits=2)
             end
             if step % args.save_every == 0
-                save_checkpoint(checkpoint_path, step, n_bins, model, opt)
+                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
-                println("  [decode @ step $step (fixed val)]")
-                run_decode_test(model, val_batch, device; n_stations=n_val_stations)
+                @info "decode" step=step n_samples=3
+                run_decode_test(model, val_batches, device; n_stations=n_val_stations)
             end
         end
     end
@@ -231,12 +298,12 @@ function main()
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
     if args.steps >= step_start && args.steps % args.save_every != 0
-        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt)
+        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads)
     end
 
     # Final decode test on fixed validation (same as during training)
-    println("\nDecode test (fixed validation spectrogram, $n_val_stations stations):")
-    run_decode_test(model, val_batch, device; n_stations=n_val_stations)
+    @info "Decode test" n_spectrograms=3 n_stations=n_val_stations
+    run_decode_test(model, val_batches, device; n_stations=n_val_stations)
 end
 
 main()

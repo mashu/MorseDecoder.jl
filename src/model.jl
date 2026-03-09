@@ -190,8 +190,8 @@ end
 From Batch targets (batch, max_stations, max_seq) build decoder input and flat targets
 for batch = batch_size × max_stations. Broadcast/reshape only; no loops or indexing.
 
-- `decoder_input`: (max_seq, batch × max_stations), [START, t1, …, t_{L-1}] per column.
-- `decoder_target`: (max_seq, batch × max_stations), padded with PAD_TOKEN_IDX.
+- `decoder_input`: (max_seq, batch × max_stations), [START, t1, …, t_{L-1}] per column (teacher forcing).
+- `decoder_target`: (max_seq, batch × max_stations), [t1, …, t_L]; loss at position i = CE(logits[i], t_i).
 - `station_mask`: (batch × max_stations,) true where (b,k) has k ≤ n_stations[b].
   Collate uses 0 for padding; we map 0 → PAD_TOKEN_IDX so embedding and loss use a valid token.
 """
