@@ -6,6 +6,8 @@ bins in [freq_lo, freq_hi] Hz.  This is the input representation for the
 decoder network.
 """
 
+using FFTW: plan_rfft
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 struct SpectrogramConfig
@@ -34,6 +36,37 @@ num_frames(cfg::SpectrogramConfig, n_samples::Int) =
 """Hann window of length `n`."""
 hann(n::Int) = Float32[0.5f0 * (1f0 - cospi(2f0 * k / (n - 1))) for k in 0:n-1]
 
+# ─── Thread-local workspace (reuse window, buffer, FFT plan) ─────────────────
+
+"""Thread-local cache keyed by nfft; parametric on plan type P, no typeof/isa."""
+struct SpectrogramWorkspace{P}
+    nfft::Int
+    win::Vector{Float32}
+    buf::Vector{Float32}
+    plan::P
+end
+
+function SpectrogramWorkspace(nfft::Int)
+    buf = Vector{Float32}(undef, nfft)
+    plan = plan_rfft(buf)
+    SpectrogramWorkspace(nfft, hann(nfft), buf, plan)
+end
+
+const spectrogram_workspace_cache = Ref{Vector{Dict{Int, SpectrogramWorkspace}}}([])
+
+"""Get or create thread-local SpectrogramWorkspace for this nfft."""
+function thread_local_workspace(nfft::Int)
+    tid = Threads.threadid()
+    wss = spectrogram_workspace_cache[]
+    while length(wss) < tid
+        push!(wss, Dict{Int, SpectrogramWorkspace}())
+    end
+    dict = @inbounds wss[tid]
+    get!(dict, nfft) do
+        SpectrogramWorkspace(nfft)
+    end
+end
+
 # ─── Core ────────────────────────────────────────────────────────────────────
 
 """
@@ -41,6 +74,8 @@ hann(n::Int) = Float32[0.5f0 * (1f0 - cospi(2f0 * k / (n - 1))) for k in 0:n-1]
 
 Compute power spectrogram in the [freq_lo, freq_hi] band.
 Returns a `(num_bins × num_frames)` matrix — ready to feed to the network.
+Uses a thread-local workspace (cached Hann window and FFT plan) for speed when
+called from parallel batch generation.
 """
 function compute_spectrogram(audio::AbstractVector{<:Real}, sr::Int,
                              cfg::SpectrogramConfig)
@@ -52,8 +87,7 @@ function compute_spectrogram(audio::AbstractVector{<:Real}, sr::Int,
     n_bins = hi_bin - lo_bin + 1
 
     spec = Matrix{Float32}(undef, n_bins, n_frames)
-    win  = hann(cfg.nfft)
-    buf  = Vector{Float32}(undef, cfg.nfft)
+    ws = thread_local_workspace(cfg.nfft)
 
     @inbounds for f in 1:n_frames
         start = (f - 1) * cfg.hop + 1
@@ -62,14 +96,16 @@ function compute_spectrogram(audio::AbstractVector{<:Real}, sr::Int,
 
         # Windowed frame (zero-pad if at boundary)
         for i in 1:len
-            buf[i] = Float32(audio[start + i - 1]) * win[i]
+            ws.buf[i] = Float32(audio[start + i - 1]) * ws.win[i]
         end
         for i in len+1:cfg.nfft
-            buf[i] = 0f0
+            ws.buf[i] = 0f0
         end
 
-        power = abs2.(rfft(buf))
-        spec[:, f] .= @view power[lo_bin:hi_bin]
+        rfft_result = ws.plan * ws.buf
+        for i in lo_bin:hi_bin
+            spec[i - lo_bin + 1, f] = abs2(rfft_result[i])
+        end
     end
 
     spec

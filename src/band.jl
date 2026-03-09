@@ -75,16 +75,16 @@ function random_band(rng::AbstractRNG;
                      noise_range::Tuple    = (0.005f0, 0.08f0),
                      text_fn::Function     = random_text)
 
-    freqs    = _spread_frequencies(rng, n_stations, freq_range)
+    freqs    = spread_frequencies(rng, n_stations, freq_range)
     stations = [Station(;
         frequency = freqs[i],
-        wpm       = _uniform(rng, wpm_range...),
-        jitter    = _uniform(rng, jitter_range...),
-        amplitude = _uniform(rng, amp_range...),
+        wpm       = uniform_float(rng, wpm_range...),
+        jitter    = uniform_float(rng, jitter_range...),
+        amplitude = uniform_float(rng, amp_range...),
     ) for i in 1:n_stations]
 
     texts   = [text_fn(rng) for _ in 1:n_stations]
-    noise_σ = _uniform(rng, noise_range...)
+    noise_σ = uniform_float(rng, noise_range...)
 
     mix_stations(stations, texts, sr, rng; noise_σ)
 end
@@ -92,11 +92,11 @@ end
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 """Sample N frequencies with minimum separation within a range."""
-function _spread_frequencies(rng::AbstractRNG, n::Int,
-                             range::Tuple{Float32,Float32})
+function spread_frequencies(rng::AbstractRNG, n::Int,
+                            range::Tuple{Float32,Float32})
     lo, hi = range
     n == 0 && return Float32[]
-    n == 1 && return Float32[_uniform(rng, lo, hi)]
+    n == 1 && return Float32[uniform_float(rng, lo, hi)]
 
     # Divide band into n equal slots, pick one freq per slot
     slot = (hi - lo) / n
@@ -106,5 +106,5 @@ function _spread_frequencies(rng::AbstractRNG, n::Int,
 end
 
 """Uniform random Float32 in [lo, hi]."""
-_uniform(rng::AbstractRNG, lo::Real, hi::Real) =
+uniform_float(rng::AbstractRNG, lo::Real, hi::Real) =
     Float32(lo) + rand(rng, Float32) * Float32(hi - lo)

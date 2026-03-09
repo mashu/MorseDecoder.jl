@@ -56,9 +56,9 @@ function parse_commandline()
         arg_type = Int
         default = 500
         "--prefetch"
-        help = "Number of batches to pre-generate (0 = no prefetch)"
+        help = "Number of batches to pre-generate and queue (0 = no prefetch). One producer task fills the queue using Threads.nthreads() inside generate_batch; use -t N for N>1."
         arg_type = Int
-        default = 128
+        default = 256
         "--lr"
         help = "Learning rate"
         arg_type = Float32
@@ -111,18 +111,18 @@ const CHUNK_FRAMES = 4
 
 """Run decode on one spectrogram, n_stations outputs; print ground truth and decoded text for comparison."""
 function run_decode_test(model, batch, device; n_stations::Int=2, max_len::Int=32)
-    _run_decode_one(model, batch, device, n_stations, max_len)
+        run_decode_one(model, batch, device, n_stations, max_len)
 end
 
 """Run decode on each of several batches (e.g. different val seeds) to see if output varies with input."""
 function run_decode_test(model, batches::AbstractVector, device; n_stations::Int=2, max_len::Int=32)
     for (i, batch) in enumerate(batches)
         @info "val sample" sample=i
-        _run_decode_one(model, batch, device, n_stations, max_len)
+        run_decode_one(model, batch, device, n_stations, max_len)
     end
 end
 
-function _run_decode_one(model, batch, device, n_stations, max_len)
+function run_decode_one(model, batch, device, n_stations, max_len)
     test_spec = batch.spectrogram[:, 1:1, :]
     test_spec = device(test_spec)
     ids = decode_autoregressive(model, test_spec, n_stations; max_len, to_device=device)
@@ -342,27 +342,33 @@ function main()
     val_batches = [generate_batch(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr save_every=args.save_every prefetch=args.prefetch decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
         return
     end
 
-    # Prefetched batch producer: fills channel so GPU doesn't wait on data.
-    # With JULIA_NUM_THREADS>1, generate_batch uses parallel sample generation to keep GPU fed.
+    # Prefetched batch producer: one async task fills the channel; each generate_batch uses
+    # Threads.nthreads() (run with -t N). Pre-fill queue so GPU has a buffer before we start.
     batch_channel = nothing
     if args.prefetch > 0
         batch_channel = Channel{Any}(args.prefetch)
-        if loaded === nothing
-            put!(batch_channel, batch)   # use the batch we already generated for n_bins
-        end
+        sync_prefill = Channel{Nothing}(1)
         @async begin
-            for _ in (loaded === nothing ? (step_start + 1) : step_start):args.steps
+            prefill = min(args.prefetch, args.steps - step_start + 1)
+            for _ in 1:prefill
+                put!(batch_channel, generate_batch(cfg, args.batch_size; rng))
+            end
+            put!(sync_prefill, nothing)
+            remaining = args.steps - step_start + 1 - prefill
+            for _ in 1:remaining
                 put!(batch_channel, generate_batch(cfg, args.batch_size; rng))
             end
             close(batch_channel)
         end
+        take!(sync_prefill)
+        close(sync_prefill)
     end
 
     t0 = time()

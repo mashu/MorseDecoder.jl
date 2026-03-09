@@ -251,14 +251,14 @@ function next_chunk!(stream::BandStream, n_samples::Int)
 
     # Find current text per station (the message active at midpoint of chunk)
     mid = stream.position + n_samples ÷ 2
-    texts = [_active_message(ss, mid) for ss in stream.streams]
+    texts = [active_message_at_position(ss, mid) for ss in stream.streams]
 
     stream.position = stop
     (spec, texts)
 end
 
 """Find which message was active at sample index `pos`."""
-function _active_message(ss::StationStream, pos::Int)
+function active_message_at_position(ss::StationStream, pos::Int)
     for (i, e) in enumerate(ss.message_ends)
         prev = i == 1 ? 0 : ss.message_ends[i-1]
         if prev < pos ≤ e

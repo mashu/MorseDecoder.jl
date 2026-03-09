@@ -44,7 +44,7 @@ plot_band(scene, SpectrogramConfig())
 module MorseDecoder
 
 using Random
-using FFTW: rfft
+using FFTW: rfft, plan_rfft
 using CairoMakie
 
 # ── Source files (order matters) ─────────────────────────────────────────────
