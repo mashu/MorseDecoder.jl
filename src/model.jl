@@ -209,10 +209,11 @@ function prepare_decoder_batch(
     # Collate pads with 0; map to pad token so embedding gets a valid index and loss masks correctly
     decoder_input = ifelse.(decoder_input .== 0, pad_token, decoder_input)
     decoder_target = ifelse.(decoder_target .== 0, pad_token, decoder_target)
-    # (K, B) with [k,b] = k <= n_stations[b], column-major -> (b-1)*K + k
-    station_mask = vec(reshape(1:K, :, 1) .<= permutedims(n_stations))
-    # (1, B*K): column j gets station index 1..K (1-based for Embedding)
-    station_ids = repeat(reshape(1:K, 1, K), 1, B)
+    # (B, K) with [b,k] = k <= n_stations[b]; vec is column-major so B varies fast,
+    # matching the (L, B, K) -> (L, B*K) reshape used for decoder_input/decoder_target.
+    station_mask = vec(reshape(n_stations, :, 1) .>= reshape(1:K, 1, :))
+    # (1, B*K): station index per column, B varies fast to match decoder ordering.
+    station_ids = reshape(repeat(reshape(1:K, 1, 1, K), 1, B, 1), 1, B * K)
     (; decoder_input, decoder_target, station_mask, station_ids)
 end
 

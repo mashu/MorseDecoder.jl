@@ -80,9 +80,9 @@ function parse_commandline()
         arg_type = Int
         default = 4
         "--teacher-forcing-prob"
-        help = "Prob of using ground truth as decoder input (1.0 = always; 0.9 = 90% GT, 10% random). Reduces exposure bias."
+        help = "Prob of using ground truth as decoder input (1.0 = always; 0.5 = 50% GT, 50% random). Reduces exposure bias."
         arg_type = Float64
-        default = 0.9
+        default = 0.5
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
