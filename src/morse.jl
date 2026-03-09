@@ -24,7 +24,6 @@ const MORSE_TABLE = Dict{Char,String}(
 
 const ALPHABET    = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 =?"
 const NUM_CHARS   = length(ALPHABET)
-const BLANK_TOKEN = NUM_CHARS + 1                          # CTC blank
 const CHAR_TO_IDX = Dict{Char,Int}(c => i for (i, c) in enumerate(ALPHABET))
 const IDX_TO_CHAR = Dict{Int,Char}(i => c for (i, c) in enumerate(ALPHABET))
 

@@ -14,9 +14,12 @@ using ArgParse
 using Logging
 using MorseDecoder
 using Flux
+using Optimisers: adjust!
+using ParameterSchedulers: OneCycle
 using Random
 using JLD2
 using ChainRulesCore
+using UnicodePlots
 
 # Multi-step gradient accumulation: sum grads over N steps then one optimizer update.
 # Uses ChainRulesCore.add!! for in-place accumulation when possible (AD-agnostic).
@@ -60,9 +63,13 @@ function parse_commandline()
         arg_type = Int
         default = 256
         "--lr"
-        help = "Learning rate"
+        help = "Peak learning rate (with --warmup-fraction > 0, schedule goes startval -> lr -> endval)"
         arg_type = Float32
         default = 1f-5
+        "--warmup-fraction"
+        help = "Fraction of steps for LR warmup (0 = constant LR). Default 0.1, capped at 2000 steps. One-cycle then cosine decay to lr/100."
+        arg_type = Float64
+        default = 0.1
         "--decode-every"
         help = "Run decode on fixed val every N steps (0 = only at end)"
         arg_type = Int
@@ -95,7 +102,7 @@ function parse_commandline()
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
       accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
-      lr = parsed["lr"], decode_every = parsed["decode-every"],
+      lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], decode_every = parsed["decode-every"],
       dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
       teacher_forcing_prob = parsed["teacher-forcing-prob"], benchmark = parsed["benchmark"])
 end
@@ -137,17 +144,13 @@ function run_decode_one(model, batch, device, n_stations, max_len)
     end
 end
 
-"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, BLANK→space, stop at PAD/START/0."""
+"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, stop at PAD/START/0."""
 function token_ids_to_string(ids::AbstractVector{<:Integer})
     buf = Char[]
     for i in ids
         (i == PAD_TOKEN_IDX || i == 0) && break
         i == START_TOKEN_IDX && continue
-        if 1 <= i <= NUM_CHARS
-            push!(buf, IDX_TO_CHAR[i])
-        elseif i == BLANK_TOKEN
-            push!(buf, ' ')
-        end
+        1 <= i <= NUM_CHARS && push!(buf, IDX_TO_CHAR[i])
     end
     String(buf)
 end
@@ -337,12 +340,34 @@ function main()
         opt = Flux.setup(Adam(args.lr), model)
     end
 
+    # LR schedule: one-cycle (warmup then cosine decay) or constant. Good defaults: warmup capped at 2000 steps, non-zero start/end LR.
+    lr_schedule = if args.warmup_fraction > 0
+        warmup_steps = min(ceil(Int, args.steps * args.warmup_fraction), 2000)
+        percent_start = warmup_steps / args.steps
+        startval = max(1f-8, args.lr / 25f0)
+        endval = max(1f-9, args.lr / 100f0)
+        @info "LR schedule" warmup_steps peak_lr=args.lr startval endval
+        OneCycle(args.steps, args.lr; startval, endval, percent_start)
+    else
+        t -> args.lr
+    end
+
+    # Plot LR schedule so we can inspect it before training
+    steps_remaining = args.steps - step_start + 1
+    if steps_remaining > 0
+        n_sample = min(400, steps_remaining)
+        steps_sample = round.(Int, range(step_start, args.steps; length=n_sample))
+        lr_vals = Float64.(lr_schedule.(steps_sample))
+        plt = lineplot(steps_sample, lr_vals; title="LR schedule", xlabel="step", ylabel="learning rate", width=60, height=15)
+        println(plt)
+    end
+
     effective_batch = args.batch_size * args.accum_steps
     # Several fixed validation batches (different seeds) so we see if decode varies with input
     val_batches = [generate_batch(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -411,6 +436,8 @@ function main()
         accum_count += 1
 
         if accum_count == args.accum_steps
+            eta = Float32(lr_schedule(min(step, args.steps)))
+            adjust!(opt, eta)
             Flux.update!(opt, model, grads_accum)
             grads_accum = nothing
             accum_count = 0
@@ -433,6 +460,8 @@ function main()
 
     # Final update if we had a partial accumulation
     if accum_count > 0
+        eta = Float32(lr_schedule(args.steps))
+        adjust!(opt, eta)
         Flux.update!(opt, model, grads_accum)
     end
 

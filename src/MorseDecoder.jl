@@ -62,7 +62,7 @@ include("model.jl")           # encoder–decoder (Onion + Flux)
 
 export
     # Morse alphabet
-    MORSE_TABLE, ALPHABET, NUM_CHARS, BLANK_TOKEN,
+    MORSE_TABLE, ALPHABET, NUM_CHARS,
     CHAR_TO_IDX, IDX_TO_CHAR, encode_text, decode_indices,
 
     # Spectrogram
