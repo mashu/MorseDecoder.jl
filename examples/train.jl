@@ -2,14 +2,19 @@
 # Train the spectrogram encoder–decoder. Run from repo root:
 #   julia --project=. examples/train.jl [options]
 # Use --help for full list and defaults.
+# Load CUDA/cuDNN before Flux so Flux uses the GPU backend.
+#
+# Benchmarking: julia -t 4 --project=. examples/train.jl --gpu --benchmark 50
+#   Reports timing breakdown (data / transfer / forward+backward / accum+update).
+#   Use -t N (N>1) so batch generation runs in parallel and keeps GPU fed.
 
+using CUDA
+using cuDNN
 using ArgParse
 using Logging
 using MorseDecoder
 using Flux
 using Random
-using CUDA
-using cuDNN
 using JLD2
 using ChainRulesCore
 
@@ -78,6 +83,10 @@ function parse_commandline()
         help = "Prob of using ground truth as decoder input (1.0 = always; 0.9 = 90% GT, 10% random). Reduces exposure bias."
         arg_type = Float64
         default = 0.9
+        "--benchmark"
+        help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
+        arg_type = Int
+        default = 0
     end
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
@@ -88,7 +97,7 @@ function parse_commandline()
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
       lr = parsed["lr"], decode_every = parsed["decode-every"],
       dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
-      teacher_forcing_prob = parsed["teacher-forcing-prob"])
+      teacher_forcing_prob = parsed["teacher-forcing-prob"], benchmark = parsed["benchmark"])
 end
 
 function build_model(n_bins::Int, chunk_frames::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
@@ -151,6 +160,125 @@ function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::
     jldsave(path; step, n_bins, chunk_frames=CHUNK_FRAMES, dim, n_layers, n_heads,
             model_state, optimiser_state=opt_cpu)
     @info "checkpoint saved" step=step path=path
+end
+
+"""Run N training steps with timing breakdown (data, transfer, forward+backward, accum+update). No prefetch so data cost is explicit. Use --gpu --benchmark 50 for GPU timing."""
+function run_benchmark(args, model, opt, cfg, device, n_bins)
+    n_steps = args.benchmark
+    warmup = min(5, max(1, n_steps ÷ 4))
+    @info "Benchmark run" n_steps=n_steps warmup=warmup device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size threads=Threads.nthreads()
+    rng = MersenneTwister(123)
+    t_data = Float64[]
+    t_transfer = Float64[]
+    t_fwbw = Float64[]
+    t_accum = Float64[]
+    sizehint!(t_data, n_steps)
+    sizehint!(t_transfer, n_steps)
+    sizehint!(t_fwbw, n_steps)
+    sizehint!(t_accum, n_steps)
+
+    grads_accum = nothing
+    accum_count = 0
+
+    # Warmup
+    for _ in 1:warmup
+        batch = generate_batch(cfg, args.batch_size; rng)
+        spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
+        spec = device(spec)
+        decoder_input = device(decoder_input)
+        decoder_target = device(decoder_target)
+        station_mask = device(station_mask)
+        station_ids = device(station_ids)
+        if args.teacher_forcing_prob < 1
+            noise_prob = 1.0 - args.teacher_forcing_prob
+            L, Bk = size(decoder_input)
+            noise_mask = rand(rng, L, Bk) .< noise_prob
+            noise_mask[1, :] .= false
+            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
+            noise_mask = device(noise_mask)
+            random_tokens = device(random_tokens)
+            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
+        end
+        result = Flux.withgradient(model) do m
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
+        end
+        if grads_accum === nothing
+            grads_accum = result.grad[1]
+        else
+            grads_accum = Flux.fmap(accum_grad, grads_accum, result.grad[1])
+        end
+        accum_count += 1
+        if accum_count == args.accum_steps
+            Flux.update!(opt, model, grads_accum)
+            grads_accum = nothing
+            accum_count = 0
+        end
+    end
+    grads_accum = nothing
+    accum_count = 0
+    if args.gpu
+        CUDA.synchronize()
+    end
+
+    # Timed run
+    for _ in 1:n_steps
+        t0 = time()
+        batch = generate_batch(cfg, args.batch_size; rng)
+        spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
+        push!(t_data, time() - t0)
+
+        t0 = time()
+        spec = device(spec)
+        decoder_input = device(decoder_input)
+        decoder_target = device(decoder_target)
+        station_mask = device(station_mask)
+        station_ids = device(station_ids)
+        if args.teacher_forcing_prob < 1
+            noise_prob = 1.0 - args.teacher_forcing_prob
+            L, Bk = size(decoder_input)
+            noise_mask = rand(rng, L, Bk) .< noise_prob
+            noise_mask[1, :] .= false
+            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
+            random_tokens = device(random_tokens)
+            noise_mask = device(noise_mask)
+            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
+        end
+        push!(t_transfer, time() - t0)
+
+        t0 = time()
+        result = Flux.withgradient(model) do m
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
+        end
+        push!(t_fwbw, time() - t0)
+
+        t0 = time()
+        if grads_accum === nothing
+            grads_accum = result.grad[1]
+        else
+            grads_accum = Flux.fmap(accum_grad, grads_accum, result.grad[1])
+        end
+        accum_count += 1
+        if accum_count == args.accum_steps
+            Flux.update!(opt, model, grads_accum)
+            grads_accum = nothing
+            accum_count = 0
+        end
+        push!(t_accum, time() - t0)
+    end
+
+    if args.gpu
+        CUDA.synchronize()
+    end
+
+    sum_data = sum(t_data) * 1000
+    sum_transfer = sum(t_transfer) * 1000
+    sum_fwbw = sum(t_fwbw) * 1000
+    sum_accum = sum(t_accum) * 1000
+    total_ms = sum_data + sum_transfer + sum_fwbw + sum_accum
+    steps_per_sec = n_steps / (total_ms / 1000)
+
+    @info "Benchmark" steps=n_steps steps_per_sec=round(steps_per_sec; digits=2)
+    @info "Timing (ms)" data=round(sum_data; digits=1) data_pct=round(100 * sum_data / total_ms; digits=1) transfer=round(sum_transfer; digits=1) transfer_pct=round(100 * sum_transfer / total_ms; digits=1) forward_backward=round(sum_fwbw; digits=1) fwbw_pct=round(100 * sum_fwbw / total_ms; digits=1) accum_update=round(sum_accum; digits=1) accum_pct=round(100 * sum_accum / total_ms; digits=1)
 end
 
 function load_checkpoint(path::String)
@@ -216,7 +344,13 @@ function main()
 
     @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr save_every=args.save_every prefetch=args.prefetch decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
 
-    # Prefetched batch producer: fills channel so GPU doesn't wait on data
+    if args.benchmark > 0
+        run_benchmark(args, model, opt, cfg, device, n_bins)
+        return
+    end
+
+    # Prefetched batch producer: fills channel so GPU doesn't wait on data.
+    # With JULIA_NUM_THREADS>1, generate_batch uses parallel sample generation to keep GPU fed.
     batch_channel = nothing
     if args.prefetch > 0
         batch_channel = Channel{Any}(args.prefetch)

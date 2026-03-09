@@ -143,15 +143,28 @@ function collate(samples::AbstractVector{Sample})
 end
 
 """
-    generate_batch(cfg, batch_size; rng, text_fn) → Batch
+    generate_batch(cfg, batch_size; rng, text_fn, parallel) → Batch
 
-Generate and collate a full training batch.
+Generate and collate a full training batch. If `parallel=true` (default when
+`Threads.nthreads() > 1`) and Julia was started with multiple threads, samples
+are generated in parallel to keep the GPU data pipeline fed.
 """
 function generate_batch(cfg::SamplerConfig, batch_size::Int;
                         rng::AbstractRNG = Random.default_rng(),
-                        text_fn::Function = random_text)
-    samples = [generate_sample(cfg; rng, text_fn) for _ in 1:batch_size]
-    collate(samples)
+                        text_fn::Function = random_text,
+                        parallel::Bool = Threads.nthreads() > 1)
+    if parallel && Threads.nthreads() > 1
+        base_seed = rand(rng, UInt)
+        samples = Vector{Sample}(undef, batch_size)
+        Threads.@threads for i in 1:batch_size
+            rng_i = MersenneTwister(hash(base_seed, UInt(i)))
+            @inbounds samples[i] = generate_sample(cfg; rng=rng_i, text_fn)
+        end
+        collate(samples)
+    else
+        samples = [generate_sample(cfg; rng, text_fn) for _ in 1:batch_size]
+        collate(samples)
+    end
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
