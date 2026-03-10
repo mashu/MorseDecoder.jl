@@ -30,8 +30,8 @@ accum_grad(a, b) = a  # fallback for Nothing / other leaf types
 
 """Total number of trainable parameters in the model (for capacity logging)."""
 function count_parameters(model)
-    # Flux.params(model) collects all parameter arrays; sum their lengths
-    sum(length, Flux.params(model))
+    flat, _ = Flux.destructure(model)
+    length(flat)
 end
 
 """Encoder dropout for this step: 0 until schedule_start, then encoder_dropout_max. Use schedule_start=0 to disable."""
