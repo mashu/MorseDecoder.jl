@@ -92,7 +92,8 @@ export
     # Model (requires Flux, Onion, Einops)
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
     prepare_decoder_batch, prepare_training_batch, train_step,
-    decode_autoregressive, multi_station_cross_entropy,
-    VOCAB_SIZE, START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX
+    decode_autoregressive, sequence_cross_entropy,
+    VOCAB_SIZE, START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX,
+    MAX_SPEAKERS, SPEAKER_1_IDX, speaker_token_id, is_speaker_token
 
 end # module MorseDecoder

@@ -90,17 +90,17 @@ end
 A padded batch of training samples, ready for the network.
 
 Fields:
-- `spectrogram`     : (freq_bins, batch, max_time)  — zero-padded
-- `targets`         : (batch, max_stations, max_seq) — index-encoded, zero-padded
-- `target_lengths`  : (batch, max_stations)
-- `input_lengths`   : (batch,)
-- `n_stations`      : (batch,)
-- `frequencies`     : (batch, max_stations) — carrier Hz (0 for absent stations)
+- `spectrogram`     : (freq_bins, batch, max_time) — zero-padded
+- `targets`         : (batch, max_seq) — single interleaved sequence per sample with speaker tokens + EOS, zero-padded
+- `target_lengths`  : (batch,) — length of valid target per sample
+- `input_lengths`   : (batch,) — spectrogram time length per sample
+- `n_stations`      : (batch,) — number of speakers in each sample (for reference)
+- `frequencies`     : (batch, max_ns) — carrier Hz per station (0 for absent)
 """
 struct Batch
     spectrogram::Array{Float32,3}
-    targets::Array{Int,3}
-    target_lengths::Matrix{Int}
+    targets::Array{Int,2}
+    target_lengths::Vector{Int}
     input_lengths::Vector{Int}
     n_stations::Vector{Int}
     frequencies::Matrix{Float32}
@@ -109,33 +109,42 @@ end
 """
     collate(samples) → Batch
 
-Pad a vector of `Sample` into uniform-size tensors.
+Build interleaved target per sample: [SPEAKER_1, text1..., SPEAKER_2, text2..., …, EOS], then pad.
 """
 function collate(samples::AbstractVector{Sample})
     B        = length(samples)
     max_ns   = maximum(s.n_stations for s in samples)
     max_time = maximum(size(s.spectrogram, 2) for s in samples)
-    # Each target is [chars...] + EOS; padding follows. So max_seq = max content length + 1.
-    max_seq  = maximum(maximum(length(encode_text(t)) + 1 for t in s.texts) for s in samples)
     n_bins   = size(first(samples).spectrogram, 1)
 
-    spec_batch = zeros(Float32, n_bins, B, max_time)
-    tgt_batch  = zeros(Int, B, max_ns, max_seq)
-    tgt_lens   = zeros(Int, B, max_ns)
-    in_lens    = zeros(Int, B)
-    ns_vec     = zeros(Int, B)
-    freq_batch = zeros(Float32, B, max_ns)
+    # Build interleaved target per sample and get max_seq
+    target_seqs = Vector{Vector{Int}}(undef, B)
+    for (b, s) in enumerate(samples)
+        enc = Int[]
+        for k in 1:min(s.n_stations, MAX_SPEAKERS)
+            push!(enc, speaker_token_id(k))
+            append!(enc, encode_text(s.texts[k]))
+        end
+        push!(enc, EOS_TOKEN_IDX)
+        target_seqs[b] = enc
+    end
+    max_seq = maximum(length(t) for t in target_seqs)
+
+    spec_batch  = zeros(Float32, n_bins, B, max_time)
+    tgt_batch   = zeros(Int, B, max_seq)
+    tgt_lens    = zeros(Int, B)
+    in_lens     = zeros(Int, B)
+    ns_vec      = zeros(Int, B)
+    freq_batch  = zeros(Float32, B, max_ns)
 
     for (b, s) in enumerate(samples)
         T = size(s.spectrogram, 2)
         spec_batch[:, b, 1:T] .= s.spectrogram
-        in_lens[b]  = T
-        ns_vec[b]   = s.n_stations
+        in_lens[b]   = T
+        ns_vec[b]    = s.n_stations
+        tgt_lens[b]  = length(target_seqs[b])
+        tgt_batch[b, 1:tgt_lens[b]] .= target_seqs[b]
         for k in 1:s.n_stations
-            enc = [encode_text(s.texts[k]); EOS_TOKEN_IDX]
-            L   = length(enc)
-            tgt_batch[b, k, 1:L] .= enc
-            tgt_lens[b, k] = L
             freq_batch[b, k] = s.frequencies[k]
         end
     end

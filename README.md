@@ -154,6 +154,22 @@ In real time, new stations can start and previous conversations can end. The mod
 
 So: **ended = EOS; new station = new content in a slot on the next chunk**, with slot assignment (e.g. by current active carriers) done in your real-time app.
 
+### Drawbacks of fixed N slots
+
+- **Wasteful when fewer stations:** Decoding with `max_stations=3` but only one station active runs three decoder streams; two are empty (and may not emit EOS cleanly).
+- **No turn order:** You get “slot 1 transcript” and “slot 2 transcript” but not “caller spoke, then A, then caller, then B”. Order of who responded when is lost.
+
+### Alternative: single stream with speaker/station tokens
+
+A different design avoids both issues:
+
+- **One decoder run, one output sequence.** No fixed N slots; decode until EOS. No empty streams.
+- **Speaker tokens in the text.** Add special tokens like `<|speaker_1|>`, `<|speaker_2|>`, … (or `<|caller|>`, `<|responder|>`). The target is a single interleaved transcript, e.g.  
+  `<|s1|> CQ CQ <|s2|> AB DE XY <|s1|> TU <|s3|> CD DE XY <|endoftext|>`.  
+  Turn order is preserved; you parse the one stream into (speaker, text) segments.
+
+**What would be needed:** (1) Vocab: add speaker tokens (e.g. 5 speakers). (2) Training data: instead of N separate transcripts per sample, generate **turn-ordered** conversations (caller then A then caller then B …) and mix audio in that order; the target is the single interleaved sequence with speaker tokens. (3) Model: one decoder output per spectrogram (no `station_embed`; decoder predicts the next token including speaker tokens). (4) Inference: one decode until EOS; parse by speaker tokens. This is a larger change to the data pipeline and model but gives order and avoids wasted slots.
+
 ## Layout
 
 | File            | Role                                      |

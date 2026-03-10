@@ -134,46 +134,59 @@ function parse_commandline()
       benchmark = parsed["benchmark"])
 end
 
-function build_model(n_bins::Int; dim=256, n_heads=4, n_layers=8, max_stations::Int=5)
+function build_model(n_bins::Int; dim=256, n_heads=4, n_layers=8)
     encoder = SpectrogramEncoder(n_bins, dim, n_heads, n_layers)
-    decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, n_layers; max_stations)
+    decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, n_layers)
     SpectrogramEncoderDecoder(encoder, decoder)
 end
 
-"""Run decode on one spectrogram, n_stations outputs; print ground truth and decoded text for comparison."""
-function run_decode_test(model, batch, device; n_stations::Int=2, max_len::Int=32)
-        run_decode_one(model, batch, device, n_stations, max_len)
+"""Run decode on one spectrogram (single stream with speaker tokens); print truth vs decoded."""
+function run_decode_test(model, batch, device; max_len::Int=128)
+    run_decode_one(model, batch, device, max_len)
 end
 
-"""Run decode on each of several batches (e.g. different val seeds) to see if output varies with input."""
-function run_decode_test(model, batches::AbstractVector, device; n_stations::Int=2, max_len::Int=32)
+"""Run decode on each of several batches."""
+function run_decode_test(model, batches::AbstractVector, device; max_len::Int=128)
     for (i, batch) in enumerate(batches)
         @info "val sample" sample=i
-        run_decode_one(model, batch, device, n_stations, max_len)
+        run_decode_one(model, batch, device, max_len)
     end
 end
 
-function run_decode_one(model, batch, device, n_stations, max_len)
+function run_decode_one(model, batch, device, max_len)
     test_spec = batch.spectrogram[:, 1:1, :]
     test_spec = device(test_spec)
-    ids = decode_autoregressive(model, test_spec, n_stations; max_len, to_device=device)
+    ids = decode_autoregressive(model, test_spec; max_len, to_device=device)
     ids_cpu = cpu(ids)
-    n_stations_actual = min(n_stations, size(batch.targets, 2))
-    for k in 1:n_stations_actual
-        truth_ids = batch.targets[1, k, :]
-        truth_s = token_ids_to_string(truth_ids)
-        seq = [ids_cpu[i, k] for i in 1:size(ids_cpu, 1)]
-        decode_s = token_ids_to_string(seq)
-        @info "station" station=k truth=(isempty(truth_s) ? "(empty)" : truth_s) decode=(isempty(decode_s) ? "(empty)" : decode_s)
-    end
+    truth_ids = batch.targets[1, :]
+    truth_s = token_ids_to_string_with_speakers(truth_ids)
+    seq = [ids_cpu[i, 1] for i in 1:size(ids_cpu, 1)]
+    decode_s = token_ids_to_string_with_speakers(seq)
+    @info "decode" truth=(isempty(truth_s) ? "(empty)" : truth_s) decode=(isempty(decode_s) ? "(empty)" : decode_s)
 end
 
-"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, stop at EOS/PAD/START/0."""
+"""Turn token ids into string; stop at EOS/PAD/0. Speaker tokens shown as [1]..[6]; chars as-is."""
+function token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer})
+    buf = Char[]
+    for i in ids
+        (i == EOS_TOKEN_IDX || i == PAD_TOKEN_IDX || i == 0) && break
+        i == START_TOKEN_IDX && continue
+        if is_speaker_token(i)
+            append!(buf, ['[', Char('0' + (i - SPEAKER_1_IDX + 1)), ']'])
+        elseif 1 <= i <= NUM_CHARS
+            push!(buf, IDX_TO_CHAR[i])
+        end
+    end
+    String(buf)
+end
+
+"""Like token_ids_to_string_with_speakers but strips speaker tokens (plain text only)."""
 function token_ids_to_string(ids::AbstractVector{<:Integer})
     buf = Char[]
     for i in ids
         (i == EOS_TOKEN_IDX || i == PAD_TOKEN_IDX || i == 0) && break
         i == START_TOKEN_IDX && continue
+        is_speaker_token(i) && continue
         1 <= i <= NUM_CHARS && push!(buf, IDX_TO_CHAR[i])
     end
     String(buf)
@@ -210,14 +223,12 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     # Warmup
     for _ in 1:warmup
         batch = generate_batch_fast(cfg, args.batch_size; rng)
-        spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
-        station_mask = device(station_mask)
-        station_ids = device(station_ids)
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+            train_step(m, spec, decoder_input, decoder_target;
                 encoder_dropout = 0.0, rng = rng) / args.accum_steps
         end
         if grads_accum === nothing
@@ -242,20 +253,18 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     for _ in 1:n_steps
         t0 = time()
         batch = generate_batch_fast(cfg, args.batch_size; rng)
-        spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target = prepare_training_batch(batch)
         push!(t_data, time() - t0)
 
         t0 = time()
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
-        station_mask = device(station_mask)
-        station_ids = device(station_ids)
         push!(t_transfer, time() - t0)
 
         t0 = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+            train_step(m, spec, decoder_input, decoder_target;
                 encoder_dropout = 0.0, rng = rng) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
@@ -367,7 +376,6 @@ function main()
     effective_batch = args.batch_size * args.accum_steps
     # Several fixed validation batches (different seeds) so we see if decode varies with input
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
-    n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
     n_params = count_parameters(model)
     @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers n_heads=args.n_heads n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
@@ -406,16 +414,14 @@ function main()
 
     for step in step_start:args.steps
         batch = args.prefetch > 0 ? take!(batch_channel) : generate_batch_fast(cfg, args.batch_size; rng)
-        spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
-        station_mask = device(station_mask)
-        station_ids = device(station_ids)
 
         enc_drop = effective_encoder_dropout(step, args)
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+            train_step(m, spec, decoder_input, decoder_target;
                 encoder_dropout = enc_drop, rng = rng) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
@@ -446,7 +452,7 @@ function main()
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
-                run_decode_test(model, val_batches, device; n_stations=n_val_stations)
+                run_decode_test(model, val_batches, device)
             end
         end
     end
@@ -464,8 +470,8 @@ function main()
     end
 
     # Final decode test on fixed validation (same as during training)
-    @info "Decode test" n_spectrograms=3 n_stations=n_val_stations
-    run_decode_test(model, val_batches, device; n_stations=n_val_stations)
+    @info "Decode test" n_spectrograms=3
+    run_decode_test(model, val_batches, device)
 end
 
 main()
