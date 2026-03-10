@@ -131,6 +131,10 @@ function synthesize_spectrogram(
         max_audio_len = max(max_audio_len, length(env))
     end
     n_frames = num_frames(cfg, max_audio_len)
+    # Cap frames for training so GPU memory stays bounded (encoder sees time/4 tokens)
+    if cfg.max_frames !== nothing
+        n_frames = min(n_frames, cfg.max_frames)
+    end
 
     spec = zeros(Float32, n_bins, n_frames)
 

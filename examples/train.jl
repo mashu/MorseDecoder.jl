@@ -112,14 +112,11 @@ function parse_commandline()
       benchmark = parsed["benchmark"])
 end
 
-function build_model(n_bins::Int, chunk_frames::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
-    token_dim = n_bins * chunk_frames
-    encoder = SpectrogramEncoder(token_dim, dim, n_heads, n_layers, chunk_frames)
+function build_model(n_bins::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
+    encoder = SpectrogramEncoder(n_bins, dim, n_heads, n_layers)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, n_layers; max_stations)
     SpectrogramEncoderDecoder(encoder, decoder)
 end
-
-const CHUNK_FRAMES = 4
 
 """Run decode on one spectrogram, n_stations outputs; print ground truth and decoded text for comparison."""
 function run_decode_test(model, batch, device; n_stations::Int=2, max_len::Int=32)
@@ -165,7 +162,7 @@ function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::
     model_cpu = cpu(model)
     opt_cpu = cpu(opt)
     model_state = Flux.state(model_cpu)
-    jldsave(path; step, n_bins, chunk_frames=CHUNK_FRAMES, dim, n_layers, n_heads,
+    jldsave(path; step, n_bins, dim, n_layers, n_heads,
             model_state, optimiser_state=opt_cpu)
     @info "checkpoint saved" step=step path=path
 end
@@ -190,7 +187,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
 
     # Warmup
     for _ in 1:warmup
-        batch = generate_batch(cfg, args.batch_size; rng)
+        batch = generate_batch_fast(cfg, args.batch_size; rng)
         spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
@@ -232,7 +229,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     # Timed run
     for _ in 1:n_steps
         t0 = time()
-        batch = generate_batch(cfg, args.batch_size; rng)
+        batch = generate_batch_fast(cfg, args.batch_size; rng)
         spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
         push!(t_data, time() - t0)
 
@@ -296,14 +293,12 @@ function load_checkpoint(path::String)
     jldopen(path, "r") do f
         step = f["step"]
         n_bins = f["n_bins"]
-        chunk_frames = f["chunk_frames"]
         model_state = f["model_state"]
         optimiser_state = f["optimiser_state"]
-        # Architecture: use saved so resume matches; old checkpoints may not have these
         dim = haskey(f, "dim") ? f["dim"] : nothing
         n_layers = haskey(f, "n_layers") ? f["n_layers"] : nothing
         n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
-        (; step, n_bins, chunk_frames, model_state, optimiser_state, dim, n_layers, n_heads)
+        (; step, n_bins, model_state, optimiser_state, dim, n_layers, n_heads)
     end
 end
 
@@ -313,9 +308,9 @@ function main()
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
-    # Data: 1–3 stations, same spectrogram config as in SamplerConfig
-    cfg = SamplerConfig(; n_stations_range=1:3, spec=SpectrogramConfig())
-    batch = generate_batch(cfg, args.batch_size; rng)
+    # Data: 1–3 stations. Spectrogram is band-limited to 100–900 Hz (Morse is 200–800 Hz); we never feed full FFT, only n_bins in that range. Cap at 512 frames for GPU memory.
+    cfg = SamplerConfig(; n_stations_range=1:3, spec=SpectrogramConfig(; freq_lo=100f0, freq_hi=900f0, max_frames=512))
+    batch = generate_batch_fast(cfg, args.batch_size; rng)
     n_bins = size(batch.spectrogram, 1)
 
     loaded = load_checkpoint(checkpoint_path)
@@ -323,15 +318,13 @@ function main()
     if loaded !== nothing
         d = loaded
         step_start = d.step + 1
-        # Use saved architecture so weights match; fall back to args for old checkpoints
         dim = something(get(d, :dim, nothing), args.dim)
         n_layers = something(get(d, :n_layers, nothing), args.n_layers)
         n_heads = something(get(d, :n_heads, nothing), args.n_heads)
         n_bins = d.n_bins
-        chunk_frames = d.chunk_frames
         model_state = d.model_state
         optimiser_state = d.optimiser_state
-        model = build_model(n_bins, chunk_frames; dim, n_heads, n_layers)
+        model = build_model(n_bins; dim, n_heads, n_layers)
         Flux.loadmodel!(model, model_state)
         opt = optimiser_state
         if args.gpu
@@ -340,7 +333,7 @@ function main()
         end
         @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim n_layers=n_layers n_heads=n_heads
     else
-        model = build_model(n_bins, CHUNK_FRAMES; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
+        model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
         if args.gpu
             model = device(model)
         end
@@ -371,7 +364,7 @@ function main()
 
     effective_batch = args.batch_size * args.accum_steps
     # Several fixed validation batches (different seeds) so we see if decode varies with input
-    val_batches = [generate_batch(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
+    val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
     @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout
@@ -390,12 +383,12 @@ function main()
         @async begin
             prefill = min(args.prefetch, args.steps - step_start + 1)
             for _ in 1:prefill
-                put!(batch_channel, generate_batch(cfg, args.batch_size; rng))
+                put!(batch_channel, generate_batch_fast(cfg, args.batch_size; rng))
             end
             put!(sync_prefill, nothing)
             remaining = args.steps - step_start + 1 - prefill
             for _ in 1:remaining
-                put!(batch_channel, generate_batch(cfg, args.batch_size; rng))
+                put!(batch_channel, generate_batch_fast(cfg, args.batch_size; rng))
             end
             close(batch_channel)
         end
@@ -409,7 +402,7 @@ function main()
     loss_sum = 0.0f0
 
     for step in step_start:args.steps
-        batch = args.prefetch > 0 ? take!(batch_channel) : generate_batch(cfg, args.batch_size; rng)
+        batch = args.prefetch > 0 ? take!(batch_channel) : generate_batch_fast(cfg, args.batch_size; rng)
         spec, decoder_input, decoder_target, station_mask, station_ids = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)

@@ -28,21 +28,17 @@ const PAD_TOKEN_IDX = NUM_CHARS + 2  # padding in decoder input/target; mask in 
 """
     SpectrogramEncoder(n_freq_bins, dim, n_heads, n_layers; ...)
 
-Maps spectrogram to a sequence of encoder hidden states using a convolutional
-frontend (like Whisper) followed by Transformer self-attention.
-
-The conv frontend uses two 1D convolutions along the time axis:
-  conv1: (n_freq_bins, time) → (dim, time)    kernel=3, pad=1
-  conv2: (dim, time) → (dim, time÷2)          kernel=3, stride=2, pad=1
-This produces overlapping, learned tokens that downsample time by 2×.
-No information is lost at chunk boundaries (unlike fixed non-overlapping patches).
+Maps spectrogram to encoder hidden states. Uses conv1 → conv2 (stride 1) → MaxPool(2) → MaxPool(2)
+for 4× time downsampling (same token count as original chunk_frames=4 design). Strided conv is
+avoided so cuDNN backward does not allocate the ~1.5 GiB workspace that causes OOM.
 
 - Input: (freq_bins, batch, time) spectrogram.
-- Output: (dim, num_tokens, batch) where num_tokens ≈ time ÷ 2.
+- Output: (dim, num_tokens, batch) where num_tokens ≈ time ÷ 4.
 """
 struct SpectrogramEncoder
     conv1
     conv2
+    pool
     blocks
     norm
     rope
@@ -61,22 +57,22 @@ function SpectrogramEncoder(
     max_len::Int = 4096,
 )
     conv1 = Conv((3,), n_freq_bins => dim, gelu; pad=1)
-    conv2 = Conv((3,), dim => dim, gelu; stride=2, pad=1)
+    conv2 = Conv((3,), dim => dim, gelu; pad=1)
+    pool = MaxPool((2,))
     blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramEncoder(conv1, conv2, blocks, norm, rope)
+    SpectrogramEncoder(conv1, conv2, pool, blocks, norm, rope)
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
     spec = log1p.(spec)
-    # spec: (freq_bins, batch, time)
-    # Flux Conv1d expects (time, channels, batch)
     x = permutedims(spec, (3, 1, 2))  # (time, freq_bins, batch)
-    x = enc.conv1(x)                  # (time, dim, batch)
-    x = enc.conv2(x)                  # (time÷2, dim, batch)
-    # Transformer wants (dim, seq_len, batch)
-    h = permutedims(x, (2, 1, 3))     # (dim, time÷2, batch)
+    x = enc.conv1(x)                   # (time, dim, batch)
+    x = enc.conv2(x)                   # (time, dim, batch)
+    x = enc.pool(x)                    # (time÷2, dim, batch)
+    x = enc.pool(x)                    # (time÷4, dim, batch)
+    h = permutedims(x, (2, 1, 3))      # (dim, time÷4, batch)
     n_tokens = size(h, 2)
     rope = enc.rope[1:n_tokens]
     for block in enc.blocks

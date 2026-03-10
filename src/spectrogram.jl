@@ -2,8 +2,9 @@
     spectrogram.jl — Short-time FFT → power spectrogram in a frequency band.
 
 Produces a (freq_bins × time_frames) matrix: one column per hop, only the
-bins in [freq_lo, freq_hi] Hz.  This is the input representation for the
-decoder network.
+bins in [freq_lo, freq_hi] Hz.  We never feed the full FFT (e.g. 257 bins);
+for Morse (200–800 Hz) using 100–900 Hz keeps freq_bins small and saves memory.
+This is the input representation for the decoder network.
 """
 
 using FFTW: plan_rfft
@@ -15,10 +16,12 @@ struct SpectrogramConfig
     hop::Int
     freq_lo::Float32
     freq_hi::Float32
+    """Max time frames (optional). When set, training spectrograms are capped to this length to keep GPU memory bounded."""
+    max_frames::Union{Int,Nothing}
 end
 
-SpectrogramConfig(; nfft=512, hop=128, freq_lo=200f0, freq_hi=800f0) =
-    SpectrogramConfig(nfft, hop, freq_lo, freq_hi)
+SpectrogramConfig(; nfft=512, hop=128, freq_lo=200f0, freq_hi=800f0, max_frames=nothing) =
+    SpectrogramConfig(nfft, hop, freq_lo, freq_hi, max_frames)
 
 """Number of frequency bins in the configured band for sample rate `sr`."""
 function num_bins(cfg::SpectrogramConfig, sr::Int)
