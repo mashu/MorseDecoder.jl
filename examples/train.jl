@@ -28,6 +28,12 @@ accum_grad(a::AbstractArray{T,N}, b::AbstractArray{T,N}) where {T,N} = add!!(a, 
 accum_grad(a::N, b::N) where N<:Number = add!!(a, b)
 accum_grad(a, b) = a  # fallback for Nothing / other leaf types
 
+"""Encoder dropout for this step: 0 until schedule_start, then encoder_dropout_max. Use schedule_start=0 to disable."""
+function effective_encoder_dropout(step::Int, args)
+    args.encoder_dropout_schedule_start <= 0 && return Float64(args.encoder_dropout)
+    step >= args.encoder_dropout_schedule_start ? Float64(args.encoder_dropout_max) : 0.0
+end
+
 function parse_commandline()
     s = ArgParseSettings(
         description = "Train spectrogram encoder–decoder for multi-station Morse. Checkpoints (model + optimiser) saved in checkpoint-dir; resume by re-running with same dir.",
@@ -65,7 +71,7 @@ function parse_commandline()
         "--lr"
         help = "Peak learning rate (with --warmup-fraction > 0, schedule goes startval -> lr -> endval)"
         arg_type = Float32
-        default = 1f-5
+        default = 3f-4
         "--warmup-fraction"
         help = "Fraction of steps for LR warmup (0 = constant LR). Default 0.1, capped at 2000 steps. One-cycle then cosine decay to lr/100."
         arg_type = Float64
@@ -77,7 +83,7 @@ function parse_commandline()
         "--dim"
         help = "Model dimension (encoder and decoder)"
         arg_type = Int
-        default = 64
+        default = 128
         "--n-layers"
         help = "Number of encoder/decoder layers (min 5 for RoPE)"
         arg_type = Int
@@ -87,13 +93,21 @@ function parse_commandline()
         arg_type = Int
         default = 4
         "--teacher-forcing-prob"
-        help = "Prob of using ground truth as decoder input (1.0 = always; 0.5 = 50% GT, 50% random). Reduces exposure bias."
+        help = "Prob of using ground truth as decoder input (1.0 = standard teacher forcing; <1.0 = scheduled sampling with model predictions at that rate)."
         arg_type = Float64
-        default = 0.5
+        default = 1.0
         "--encoder-dropout"
-        help = "Prob of zeroing encoder output per step (0 = off). Use 0.1 to force decoder to use encoder."
+        help = "Fixed prob of zeroing encoder output per step (0 = off). Overridden by --encoder-dropout-schedule when used."
         arg_type = Float64
-        default = 0.1
+        default = 0.0
+        "--encoder-dropout-schedule-start"
+        help = "Step at which to start gradual encoder dropout (0 = disabled; then encoder dropout ramps to --encoder-dropout-max)."
+        arg_type = Int
+        default = 5000
+        "--encoder-dropout-max"
+        help = "Max encoder dropout when using schedule (e.g. 0.05 after 5K steps)."
+        arg_type = Float64
+        default = 0.05
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
@@ -109,6 +123,8 @@ function parse_commandline()
       lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], decode_every = parsed["decode-every"],
       dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
       teacher_forcing_prob = parsed["teacher-forcing-prob"], encoder_dropout = parsed["encoder-dropout"],
+      encoder_dropout_schedule_start = parsed["encoder-dropout-schedule-start"],
+      encoder_dropout_max = parsed["encoder-dropout-max"],
       benchmark = parsed["benchmark"])
 end
 
@@ -194,19 +210,9 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
         decoder_target = device(decoder_target)
         station_mask = device(station_mask)
         station_ids = device(station_ids)
-        if args.teacher_forcing_prob < 1
-            noise_prob = 1.0 - args.teacher_forcing_prob
-            L, Bk = size(decoder_input)
-            noise_mask = rand(rng, L, Bk) .< noise_prob
-            noise_mask[1, :] .= false
-            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
-            noise_mask = device(noise_mask)
-            random_tokens = device(random_tokens)
-            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
-        end
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
-                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
+                encoder_dropout = 0.0, rng = rng) / args.accum_steps
         end
         if grads_accum === nothing
             grads_accum = result.grad[1]
@@ -239,22 +245,12 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
         decoder_target = device(decoder_target)
         station_mask = device(station_mask)
         station_ids = device(station_ids)
-        if args.teacher_forcing_prob < 1
-            noise_prob = 1.0 - args.teacher_forcing_prob
-            L, Bk = size(decoder_input)
-            noise_mask = rand(rng, L, Bk) .< noise_prob
-            noise_mask[1, :] .= false
-            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
-            random_tokens = device(random_tokens)
-            noise_mask = device(noise_mask)
-            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
-        end
         push!(t_transfer, time() - t0)
 
         t0 = time()
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
-                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
+                encoder_dropout = 0.0, rng = rng) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
 
@@ -367,7 +363,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -410,22 +406,10 @@ function main()
         station_mask = device(station_mask)
         station_ids = device(station_ids)
 
-        # Scheduled-sampling style: with prob (1 - teacher_forcing_prob) replace decoder input (except START) with random token so model learns to use encoder when prefix is wrong
-        if args.teacher_forcing_prob < 1
-            noise_prob = 1.0 - args.teacher_forcing_prob
-            L, Bk = size(decoder_input)
-            noise_mask = rand(rng, L, Bk) .< noise_prob
-            noise_mask[1, :] .= false   # keep START
-            random_tokens = rand(rng, 1:VOCAB_SIZE, L, Bk)
-            random_tokens = device(random_tokens)
-            noise_mask = device(noise_mask)
-            decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
-        end
-
-        t_step = time()
+        enc_drop = effective_encoder_dropout(step, args)
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
-                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
+                encoder_dropout = enc_drop, rng = rng) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
@@ -447,7 +431,8 @@ function main()
             if step % 50 == 0
                 elapsed_total = time() - t0
                 steps_per_sec = (step - step_start + 1) / max(elapsed_total, 1e-9)
-                @info "step" step=step loss=round(loss_avg; digits=4) steps_per_sec=round(steps_per_sec; digits=2)
+                eta = Float64(lr_schedule(min(step, args.steps)))
+                @info "step" step=step loss=round(loss_avg; digits=4) lr=eta steps_per_sec=round(steps_per_sec; digits=2)
             end
             if step % args.save_every == 0
                 save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads)
