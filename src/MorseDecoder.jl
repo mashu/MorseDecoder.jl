@@ -55,6 +55,7 @@ include("signal.jl")          # Station, synthesize
 include("messages.jl")        # callsigns, exchange text
 include("band.jl")            # multi-station mixing
 include("sampler.jl")         # training data + streaming
+include("fast_spectrogram.jl") # direct spectrogram synthesis (no audio/FFT)
 include("viz.jl")             # plots
 include("model.jl")           # encoder–decoder (Onion + Flux)
 
@@ -80,6 +81,7 @@ export
     # Sampler
     Sample, SamplerConfig, generate_sample,
     Batch, collate, generate_batch,
+    synthesize_spectrogram, generate_sample_fast, generate_batch_fast,
 
     # Streaming
     StationStream, BandStream, next_chunk!, reset!,

@@ -23,50 +23,26 @@ const VOCAB_SIZE = NUM_CHARS + 2
 const START_TOKEN_IDX = NUM_CHARS + 1
 const PAD_TOKEN_IDX = NUM_CHARS + 2  # padding in decoder input/target; mask in loss
 
-# ─── Spectrogram → tokens (no mutation) ────────────────────────────────────────
-
-"""
-    pad_time_to_multiple(x, chunk_frames)
-
-Return a new array with time dimension (last) padded to a multiple of `chunk_frames`.
-Input `x` has shape (freq_bins, batch, time). No mutation of `x`. Branch-free.
-"""
-function pad_time_to_multiple(x::AbstractArray{T,3}, chunk_frames::Int) where T
-    F, B, T_len = size(x)
-    pad_len = mod(chunk_frames - mod(T_len, chunk_frames), chunk_frames)
-    cat(x, zeros(T, F, B, pad_len); dims=3)
-end
-
-"""
-    spectrogram_to_tokens(spec, chunk_frames)
-
-Chop spectrogram into non-overlapping time chunks as tokens.
-- `spec`: (freq_bins, batch, time)
-- Returns: (token_dim, num_tokens, batch) where token_dim = freq_bins * chunk_frames.
-Pure function; uses reshape/rearrange only.
-"""
-function spectrogram_to_tokens(spec::AbstractArray{T,3}, chunk_frames::Int) where T
-    spec_pad = pad_time_to_multiple(spec, chunk_frames)
-    F, B, T_len = size(spec_pad)
-    n_tokens = div(T_len, chunk_frames)
-    # (freq_bins, batch, time) -> (freq_bins, batch, (t c)) -> (freq_bins c) t batch
-    tokens = rearrange(spec_pad, @einops_str("f b (t c) -> (f c) t b"); t=n_tokens, c=chunk_frames)
-    return tokens
-end
-
 # ─── Encoder ─────────────────────────────────────────────────────────────────
 
 """
-    SpectrogramEncoder(token_dim, dim, n_heads, n_layers, chunk_frames; n_kv_heads, ff_mult)
+    SpectrogramEncoder(n_freq_bins, dim, n_heads, n_layers; ...)
 
-Maps spectrogram tokens to a sequence of encoder hidden states.
+Maps spectrogram to a sequence of encoder hidden states using a convolutional
+frontend (like Whisper) followed by Transformer self-attention.
+
+The conv frontend uses two 1D convolutions along the time axis:
+  conv1: (n_freq_bins, time) → (dim, time)    kernel=3, pad=1
+  conv2: (dim, time) → (dim, time÷2)          kernel=3, stride=2, pad=1
+This produces overlapping, learned tokens that downsample time by 2×.
+No information is lost at chunk boundaries (unlike fixed non-overlapping patches).
+
 - Input: (freq_bins, batch, time) spectrogram.
-- Output: (dim, num_tokens, batch).
-All operations are pure (no mutation, no indexing in forward).
+- Output: (dim, num_tokens, batch) where num_tokens ≈ time ÷ 2.
 """
 struct SpectrogramEncoder
-    chunk_frames::Int
-    token_proj
+    conv1
+    conv2
     blocks
     norm
     rope
@@ -75,30 +51,33 @@ end
 Flux.@layer SpectrogramEncoder
 
 function SpectrogramEncoder(
-    token_dim::Int,
+    n_freq_bins::Int,
     dim::Int,
     n_heads::Int,
-    n_layers::Int,
-    chunk_frames::Int;
+    n_layers::Int;
     n_kv_heads::Int = n_heads,
     ff_mult::Int = 4,
     norm_eps::Float32 = 1f-5,
-    max_len::Int = 2048,
+    max_len::Int = 4096,
 )
-    token_proj = Dense(token_dim => dim)
+    conv1 = Conv((3,), n_freq_bins => dim, gelu; pad=1)
+    conv2 = Conv((3,), dim => dim, gelu; stride=2, pad=1)
     blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramEncoder(chunk_frames, token_proj, blocks, norm, rope)
+    SpectrogramEncoder(conv1, conv2, blocks, norm, rope)
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
-    # Log-scale spectrogram: raw power has huge dynamic range and prevents encoder from
-    # learning; log1p is standard for neural spectrogram models and preserves gradients.
     spec = log1p.(spec)
-    tokens = spectrogram_to_tokens(spec, enc.chunk_frames)
-    n_tokens = size(tokens, 2)
-    h = enc.token_proj(tokens)
+    # spec: (freq_bins, batch, time)
+    # Flux Conv1d expects (time, channels, batch)
+    x = permutedims(spec, (3, 1, 2))  # (time, freq_bins, batch)
+    x = enc.conv1(x)                  # (time, dim, batch)
+    x = enc.conv2(x)                  # (time÷2, dim, batch)
+    # Transformer wants (dim, seq_len, batch)
+    h = permutedims(x, (2, 1, 3))     # (dim, time÷2, batch)
+    n_tokens = size(h, 2)
     rope = enc.rope[1:n_tokens]
     for block in enc.blocks
         h = block(h; rope=rope, krope=rope)
@@ -169,7 +148,7 @@ end
 # ─── Full model ───────────────────────────────────────────────────────────────
 
 """
-    SpectrogramEncoderDecoder(; encoder, decoder, chunk_frames)
+    SpectrogramEncoderDecoder(encoder, decoder)
 
 Full model: encoder maps spectrogram to memory; decoder maps (decoder_input_ids, memory) to logits.
 """
