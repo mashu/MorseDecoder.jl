@@ -328,21 +328,28 @@ function main()
     step_start = 1
     if loaded !== nothing
         d = loaded
-        step_start = d.step + 1
         dim = something(get(d, :dim, nothing), args.dim)
         n_layers = something(get(d, :n_layers, nothing), args.n_layers)
         n_heads = something(get(d, :n_heads, nothing), args.n_heads)
-        n_bins = d.n_bins
-        model_state = d.model_state
-        optimiser_state = d.optimiser_state
-        model = build_model(n_bins; dim, n_heads, n_layers)
-        Flux.loadmodel!(model, model_state)
-        opt = optimiser_state
-        if args.gpu
-            model = device(model)
-            opt = device(opt)
+        model = build_model(d.n_bins; dim, n_heads, n_layers)
+        try
+            Flux.loadmodel!(model, d.model_state)
+            step_start = d.step + 1
+            n_bins = d.n_bins
+            opt = d.optimiser_state
+            if args.gpu
+                model = device(model)
+                opt = device(opt)
+            end
+            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim n_layers=n_layers n_heads=n_heads
+        catch e
+            @warn "Checkpoint incompatible (e.g. old architecture); starting fresh" path=checkpoint_path exception=(e isa Exception ? e : nothing)
+            model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
+            if args.gpu
+                model = device(model)
+            end
+            opt = Flux.setup(Adam(args.lr), model)
         end
-        @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim n_layers=n_layers n_heads=n_heads
     else
         model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
         if args.gpu

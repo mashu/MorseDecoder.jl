@@ -194,3 +194,56 @@ end
 
 """Convenience: just the text."""
 random_text(rng::AbstractRNG) = first(random_message(rng))
+
+# ─── Contest runner (one caller working multiple stations) ────────────────────
+
+"""
+    contest_turns(rng, runner_call, n_responders) → Vector{Tuple{Int,String}}
+
+Generate turn-by-turn contest exchange following real protocol: one runner
+(speaker 1) calls CQ, works each responder in turn. Runner **repeats the
+responder's callsign** when replying (e.g. "OK7CL TU") so it's clear who is
+being acknowledged; optionally responder sends "TU" back. Returns
+[(speaker, text), ...] with speaker 1 = runner, 2..n = responders.
+"""
+function contest_turns(rng::AbstractRNG, runner_call::String, n_responders::Int)
+    n_responders = max(1, n_responders)
+    turns = Tuple{Int,String}[]
+
+    # Runner calls CQ
+    cq = rand(rng, ["CQ CQ $runner_call $runner_call K", "CQ CQ DE $runner_call $runner_call K", "CQ $runner_call K"])
+    push!(turns, (1, cq))
+
+    for k in 1:n_responders
+        responder = 1 + k  # speaker 2, 3, 4, ...
+        resp_call = random_callsign(rng)
+        rst = random_rst(rng)
+        # Responder: runner DE resp_call RST zone/serial (who they're calling + their report)
+        if rand(rng) < 0.5
+            zone = lpad(rand(rng, ZONES), 2, '0')
+            push!(turns, (responder, "$runner_call DE $resp_call $rst $zone"))
+        else
+            ser = random_serial(rng)
+            push!(turns, (responder, "$runner_call DE $resp_call $rst $ser"))
+        end
+        # Runner replies **to this responder** by repeating their callsign (real contest protocol)
+        runner_tu = rand(rng, [
+            "$resp_call TU",
+            "$resp_call $rst TU",
+            "R $resp_call $rst TU",
+            "CFM $resp_call $rst",
+        ])
+        push!(turns, (1, runner_tu))
+        # Optional: responder sends TU back (many do this)
+        if rand(rng) < 0.6
+            push!(turns, (responder, "TU"))
+        end
+        # Runner calls next (unless last)
+        if k < n_responders
+            next_call = random_callsign(rng)
+            push!(turns, (1, "$next_call $next_call K"))
+        end
+    end
+
+    turns
+end

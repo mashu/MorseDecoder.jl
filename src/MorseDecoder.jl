@@ -76,7 +76,7 @@ export
     random_callsign, random_message, random_text,
 
     # Band mixing
-    BandScene, mix_stations, random_band,
+    BandScene, mix_stations, random_band, mix_conversation, random_conversation_band, random_contest_conversation_band,
 
     # Sampler
     Sample, SamplerConfig, generate_sample,

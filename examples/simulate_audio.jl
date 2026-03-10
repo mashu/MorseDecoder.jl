@@ -1,7 +1,15 @@
 #!/usr/bin/env julia
-# Simulate a multi-station Morse band; save WAV, transcript, and spectrogram PNG.
-# Run from repo root: julia --project=. examples/simulate_audio.jl [output_prefix]
-# Default prefix "band" → band.wav, band_transcript.txt, band.png
+# Simulate **contest-style** band: one runner (station 1) calling CQ and working
+# multiple responders (stations 2, 3, …) in sequence. Saves WAV, transcript, and
+# spectrogram PNG.
+#
+# Run from repo root:
+#   julia --project=. examples/simulate_audio.jl [output_prefix]
+#
+# Output (default prefix "band"):
+#   band.wav             — mixed audio (8 kHz), stations key in turn
+#   band_transcript.txt  — per-station full text + interleaved "[1] ... [2] ..."
+#   band.png             — waveform + spectrogram with station frequencies
 
 using MorseDecoder, Random, WAV, CairoMakie
 
@@ -9,30 +17,40 @@ function main()
     prefix = length(ARGS) >= 1 ? ARGS[1] : "band"
     rng = MersenneTwister(42)
 
-    # Random band: 3 stations, 8 kHz (use fixed seed for reproducibility)
-    scene = random_band(rng; n_stations=3, sr=8000)
-
-    # Spectrogram config: 200–800 Hz band, nfft/hop tuned for model input
-    # (enough time/freq resolution, compact so the heatmap array stays manageable)
-    spec_cfg = SpectrogramConfig(; freq_lo=200f0, freq_hi=800f0)  # default nfft=1024 for ~10 Hz resolution
+    # Contest-style: one runner calling CQ and working 2–4 responders in sequence.
+    scene = random_contest_conversation_band(rng; n_responders=2 + rand(rng, 0:2), sr=8000)
+    spec_cfg = SpectrogramConfig(; freq_lo=100f0, freq_hi=900f0)  # same as train.jl
 
     # Save audio
     wavpath = "$prefix.wav"
     wavwrite(scene.audio, wavpath; Fs=scene.sr)
-    println("Wrote audio: $wavpath ($(length(scene.audio)/scene.sr) s @ $(scene.sr) Hz)")
+    duration_s = length(scene.audio) / scene.sr
+    println("Wrote audio: $wavpath ($(round(duration_s; digits=2)) s @ $(scene.sr) Hz)")
 
-    # Save transcript (one line per station)
+    # Transcript: per-station lines + one interleaved line (turn order = model target [1] ... [2] ... [1] ...)
     txtpath = "$(prefix)_transcript.txt"
+    interleaved = if scene.turns !== nothing
+        join(("[$(spk)] $(txt)" for (spk, txt) in scene.turns), " ")
+    else
+        join(("[$(k)] $(scene.texts[k])" for k in 1:length(scene.texts)), " ")
+    end
     open(txtpath, "w") do io
+        println(io, "Contest-style: 1 runner + $(length(scene.stations)-1) responders, turn-based (no overlap).")
+        println(io, "")
         for (i, (st, txt)) in enumerate(zip(scene.stations, scene.texts))
-            line = "Station $i @ $(round(st.frequency; digits=1)) Hz (WPM $(st.wpm)): $txt"
+            line = "Station $i @ $(round(st.frequency; digits=1)) Hz (WPM $(round(st.wpm; digits=0))): $txt"
             println(io, line)
             println(line)
         end
+        println(io, "")
+        println(io, "Interleaved (model target format):")
+        println(io, interleaved)
+        println()
+        println("Interleaved (model target): ", interleaved)
     end
     println("Wrote transcript: $txtpath")
 
-    # Spectrogram visualization (200–800 Hz, same as model input)
+    # Spectrogram plot (100–900 Hz, same as model input)
     fig = plot_band(scene, spec_cfg)
     pngpath = "$prefix.png"
     save(pngpath, fig)

@@ -14,15 +14,18 @@ Result of mixing multiple stations.
 Fields:
 - `audio`    : mixed audio waveform (sum of all stations + noise)
 - `stations` : per-station parameters
-- `texts`    : per-station transmitted text
+- `texts`    : per-station transmitted text (full text per station)
 - `sr`       : sample rate (Hz)
+- `turns`    : optional turn order `[(speaker, text), ...]` for interleaved transcript
 """
 struct BandScene
     audio::Vector{Float32}
     stations::Vector{Station}
     texts::Vector{String}
     sr::Int
+    turns::Union{Nothing, Vector{Tuple{Int,String}}}
 end
+BandScene(audio, stations, texts, sr) = BandScene(audio, stations, texts, sr, nothing)
 
 # ─── Mixing ──────────────────────────────────────────────────────────────────
 
@@ -53,7 +56,122 @@ function mix_stations(stations::AbstractVector{Station},
     end
 
     clamp!(mixed, -1f0, 1f0)
-    BandScene(mixed, collect(stations), collect(texts), sr)
+    BandScene(mixed, collect(stations), collect(texts), sr, nothing)
+end
+
+# ─── Turn-based conversation ────────────────────────────────────────────────
+
+"""
+    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ) → BandScene
+
+Mix a **conversation**: stations take turns. `turns` is a vector of (speaker_index, text)
+with speaker_index in 1:length(stations). Each segment is synthesized and placed in time
+one after another (optional gap between turns). Only the current speaker keys; no overlap.
+"""
+function mix_conversation(stations::AbstractVector{Station},
+                          turns::AbstractVector{Tuple{Int,String}},
+                          sr::Int, rng::AbstractRNG;
+                          gap_ms::Real = 200f0,
+                          noise_σ::Float32 = 0.02f0)
+    isempty(turns) && return BandScene(Float32[], collect(stations), ["" for _ in stations], sr, nothing)
+    gap_samples = max(0, round(Int, sr * gap_ms / 1000))
+
+    # First pass: synthesize each turn
+    turn_audios = [synthesize(stations[t[1]], t[2], sr, rng) for t in turns]
+    total_len = sum(length, turn_audios) + gap_samples * (length(turns) - 1)
+    mixed = zeros(Float32, total_len)
+
+    offset = 1
+    for (i, a) in enumerate(turn_audios)
+        n = length(a)
+        @views mixed[offset:offset + n - 1] .+= a
+        offset += n + gap_samples
+    end
+
+    if noise_σ > 0f0
+        mixed .+= noise_σ .* randn(rng, Float32, total_len)
+    end
+    clamp!(mixed, -1f0, 1f0)
+
+    # Full text per station (concatenate that station's segments for transcript)
+    n_stations = length(stations)
+    station_texts = [String[] for _ in 1:n_stations]
+    for (spk, txt) in turns
+        1 <= spk <= n_stations && push!(station_texts[spk], txt)
+    end
+    texts = [join(t, " ") for t in station_texts]
+
+    BandScene(mixed, collect(stations), texts, sr, collect(turns))
+end
+
+"""
+    random_conversation_band(rng; n_stations, sr, n_turns, kw...) → BandScene
+
+Generate a random **turn-based** conversation: 2 or more stations, each turn is one
+short message from one speaker (no overlap). Uses random_message for content.
+"""
+function random_conversation_band(rng::AbstractRNG;
+                                  n_stations::Int = 2 + rand(rng, 0:1),  # 2 or 3
+                                  sr::Int = 8000,
+                                  n_turns::Int = 4 + rand(rng, 0:4),     # 4–8 turns
+                                  freq_range::Tuple = (250f0, 750f0),
+                                  wpm_range::Tuple = (15f0, 40f0),
+                                  jitter_range::Tuple = (0.08f0, 0.25f0),
+                                  amp_range::Tuple = (0.3f0, 1.0f0),
+                                  noise_range::Tuple = (0.005f0, 0.08f0),
+                                  gap_ms::Real = 200f0,
+                                  text_fn::Function = random_text)
+    n_stations = max(2, n_stations)
+    freqs = spread_frequencies(rng, n_stations, freq_range)
+    stations = [Station(;
+        frequency = freqs[i],
+        wpm      = uniform_float(rng, wpm_range...),
+        jitter   = uniform_float(rng, jitter_range...),
+        amplitude = uniform_float(rng, amp_range...),
+    ) for i in 1:n_stations]
+
+    # Round-robin turns: speaker 1, 2, 1, 2, ... or 1,2,3,1,2,3,...
+    turns = Tuple{Int,String}[]
+    for i in 1:n_turns
+        speaker = mod1(i, n_stations)
+        push!(turns, (speaker, text_fn(rng)))
+    end
+
+    noise_σ = uniform_float(rng, noise_range...)
+    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ)
+end
+
+"""
+    random_contest_conversation_band(rng; n_responders, sr, kw...) → BandScene
+
+Contest-style: **one runner** (station 1) calling CQ and working **multiple
+responders** (stations 2, 3, …) in sequence. Runner calls CQ → responder 1
+sends report → runner TU → runner calls next → responder 2 report → runner TU → …
+Like a real contest mult where one station works many in turn.
+"""
+function random_contest_conversation_band(rng::AbstractRNG;
+                                         n_responders::Int = 2 + rand(rng, 0:2),  # 2–4 responders
+                                         sr::Int = 8000,
+                                         freq_range::Tuple = (250f0, 750f0),
+                                         wpm_range::Tuple = (15f0, 40f0),
+                                         jitter_range::Tuple = (0.08f0, 0.25f0),
+                                         amp_range::Tuple = (0.3f0, 1.0f0),
+                                         noise_range::Tuple = (0.005f0, 0.08f0),
+                                         gap_ms::Real = 150f0)
+    n_stations = 1 + max(1, n_responders)
+    freqs = spread_frequencies(rng, n_stations, freq_range)
+    stations = [Station(;
+        frequency = freqs[i],
+        wpm      = uniform_float(rng, wpm_range...),
+        jitter   = uniform_float(rng, jitter_range...),
+        amplitude = uniform_float(rng, amp_range...),
+    ) for i in 1:n_stations]
+
+    runner_call = random_callsign(rng)
+    turns = contest_turns(rng, runner_call, n_responders)
+
+    noise_σ = uniform_float(rng, noise_range...)
+    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ)
 end
 
 # ─── Random band generation ─────────────────────────────────────────────────
