@@ -14,6 +14,7 @@ using Flux
 using Onion
 using Onion: TransformerBlock, RoPE, RMSNorm
 using Einops: rearrange, @einops_str
+using Random
 
 # ─── Vocab and constants ─────────────────────────────────────────────────────
 
@@ -92,6 +93,9 @@ function SpectrogramEncoder(
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
+    # Log-scale spectrogram: raw power has huge dynamic range and prevents encoder from
+    # learning; log1p is standard for neural spectrogram models and preserves gradients.
+    spec = log1p.(spec)
     tokens = spectrogram_to_tokens(spec, enc.chunk_frames)
     n_tokens = size(tokens, 2)
     h = enc.token_proj(tokens)
@@ -266,9 +270,11 @@ function prepare_training_batch(batch::Batch)
 end
 
 """
-    train_step(model, spec, decoder_input, decoder_target, station_mask, station_ids)
+    train_step(model, spec, decoder_input, decoder_target, station_mask, station_ids; encoder_dropout, rng)
 
 Single training step. All array arguments must already be on the desired device (e.g. gpu(...)).
+If encoder_dropout > 0, with that probability the encoder output is zeroed for the whole batch
+so the decoder cannot rely on it; this encourages the decoder to actually use the encoder when present.
 """
 function train_step(
     model::SpectrogramEncoderDecoder,
@@ -276,17 +282,22 @@ function train_step(
     decoder_input,
     decoder_target,
     station_mask,
-    station_ids,
+    station_ids;
+    encoder_dropout::Real = 0.0,
+    rng::AbstractRNG = Random.default_rng(),
 )
     memory = model.encoder(spec)
     K = size(decoder_input, 2) ÷ size(memory, 3)
     memory_rep = repeat_memory_for_stations(memory, K)
+    if encoder_dropout > 0 && rand(rng, Float32) < encoder_dropout
+        memory_rep = memory_rep .* 0f0  # same device and shape, zeros
+    end
     logits = model.decoder(decoder_input, memory_rep, station_ids)
     multi_station_cross_entropy(logits, decoder_target, station_mask)
 end
 
-train_step(model::SpectrogramEncoderDecoder, batch::Batch) =
-    train_step(model, prepare_training_batch(batch)...)
+train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
+    train_step(model, prepare_training_batch(batch)...; kws...)
 
 # ─── Autoregressive sampling ───────────────────────────────────────────────────
 

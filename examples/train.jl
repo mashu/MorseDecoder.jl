@@ -90,6 +90,10 @@ function parse_commandline()
         help = "Prob of using ground truth as decoder input (1.0 = always; 0.5 = 50% GT, 50% random). Reduces exposure bias."
         arg_type = Float64
         default = 0.5
+        "--encoder-dropout"
+        help = "Prob of zeroing encoder output per step (0 = off). Use 0.1 to force decoder to use encoder."
+        arg_type = Float64
+        default = 0.1
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
@@ -104,7 +108,8 @@ function parse_commandline()
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
       lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], decode_every = parsed["decode-every"],
       dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
-      teacher_forcing_prob = parsed["teacher-forcing-prob"], benchmark = parsed["benchmark"])
+      teacher_forcing_prob = parsed["teacher-forcing-prob"], encoder_dropout = parsed["encoder-dropout"],
+      benchmark = parsed["benchmark"])
 end
 
 function build_model(n_bins::Int, chunk_frames::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
@@ -203,7 +208,8 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
             decoder_input = ifelse.(noise_mask, random_tokens, decoder_input)
         end
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
         end
         if grads_accum === nothing
             grads_accum = result.grad[1]
@@ -250,7 +256,8 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
 
         t0 = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
 
@@ -367,7 +374,7 @@ function main()
     val_batches = [generate_batch(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -424,7 +431,8 @@ function main()
 
         t_step = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, station_mask, station_ids;
+                encoder_dropout = args.encoder_dropout, rng = rng) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
