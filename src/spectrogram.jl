@@ -85,24 +85,29 @@ function compute_spectrogram(audio::AbstractVector{<:Real}, sr::Int,
     lo_bin = 1 + floor(Int, cfg.freq_lo * cfg.nfft / sr)
     hi_bin = 1 + floor(Int, cfg.freq_hi * cfg.nfft / sr)
     n_bins = hi_bin - lo_bin + 1
+    nfft = cfg.nfft
+    hop = cfg.hop
 
     spec = Matrix{Float32}(undef, n_bins, n_frames)
-    ws = thread_local_workspace(cfg.nfft)
+    ws = thread_local_workspace(nfft)
+    buf = ws.buf
+    win = ws.win
+    plan = ws.plan
 
     @inbounds for f in 1:n_frames
-        start = (f - 1) * cfg.hop + 1
-        stop  = min(start + cfg.nfft - 1, n)
+        start = (f - 1) * hop + 1
+        stop  = min(start + nfft - 1, n)
         len   = stop - start + 1
 
         # Windowed frame (zero-pad if at boundary)
         for i in 1:len
-            ws.buf[i] = Float32(audio[start + i - 1]) * ws.win[i]
+            buf[i] = Float32(audio[start + i - 1]) * win[i]
         end
-        for i in len+1:cfg.nfft
-            ws.buf[i] = 0f0
+        for i in len+1:nfft
+            buf[i] = 0f0
         end
 
-        rfft_result = ws.plan * ws.buf
+        rfft_result = plan * buf
         for i in lo_bin:hi_bin
             spec[i - lo_bin + 1, f] = abs2(rfft_result[i])
         end

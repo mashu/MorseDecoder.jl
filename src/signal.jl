@@ -85,12 +85,13 @@ function synthesize(station::Station, text::AbstractString, sr::Int,
                     rng::AbstractRNG; ramp_ms::Real=5f0)
     env = keying_envelope(text, station.wpm, sr, station.jitter, rng)
     env = smooth_envelope(env, sr; ramp_ms)
-    n   = length(env)
-    ω   = 2f0 * Float32(π) * station.frequency / sr
+    n = length(env)
+    ω = 2f0 * Float32(π) * station.frequency / sr
+    amp = station.amplitude
 
     audio = Vector{Float32}(undef, n)
-    @inbounds for i in 1:n
-        audio[i] = station.amplitude * env[i] * sin(ω * (i - 1))
+    @inbounds @simd for i in 1:n
+        audio[i] = amp * env[i] * sin(ω * (i - 1))
     end
     audio
 end

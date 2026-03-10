@@ -47,36 +47,55 @@ end
 
 # ─── Keying envelope ────────────────────────────────────────────────────────
 
+# Conservative upper bound: lead 3dit + per char at most ~25 dits (5 dahs + gaps) + trail 3dit
+_envelope_upper_bound(dit::Int, text_len::Int) = 6dit + max(1000, text_len * 28 * dit)
+
 """
     keying_envelope(text, wpm, sr, jitter, rng) → Vector{Float32}
 
 Build the on/off keying envelope for `text`.  Returns a vector of 0s and 1s
-(with jittered timing when `jitter > 0`).
+(with jittered timing when `jitter > 0`). Single preallocated buffer, one pass.
 """
 function keying_envelope(text::AbstractString, wpm::Real, sr::Int,
                          jitter::Float32, rng::AbstractRNG)
     dit = dit_samples(wpm, sr)
     j(n) = jittered(n, jitter, rng)
 
-    parts = Vector{Float32}[]
-    push!(parts, zeros(Float32, 3dit))                     # lead-in silence
+    cap = _envelope_upper_bound(dit, length(text))
+    out = Vector{Float32}(undef, cap)
+    pos = 1
+
+    # Lead-in
+    len = 3dit
+    @inbounds for i in pos:pos+len-1; out[i] = 0f0; end
+    pos += len
 
     for ch in text
         if ch == ' '
-            push!(parts, zeros(Float32, 7j(dit)))          # word gap
+            len = 7j(dit)
+            @inbounds for i in pos:pos+len-1; out[i] = 0f0; end
+            pos += len
             continue
         end
         morse = get(MORSE_TABLE, ch, nothing)
         isnothing(morse) && continue
-
-        for (k, sym) in enumerate(morse)
+        for sym in morse
             on = sym == '.' ? j(dit) : j(3dit)
-            push!(parts, ones(Float32, on))                # key down
-            push!(parts, zeros(Float32, j(dit)))           # inter-element gap
+            @inbounds for i in pos:pos+on-1; out[i] = 1f0; end
+            pos += on
+            len = j(dit)
+            @inbounds for i in pos:pos+len-1; out[i] = 0f0; end
+            pos += len
         end
-        push!(parts, zeros(Float32, 2j(dit)))              # extra gap → 3 dit char gap
+        len = 2j(dit)
+        @inbounds for i in pos:pos+len-1; out[i] = 0f0; end
+        pos += len
     end
 
-    push!(parts, zeros(Float32, 3dit))                     # trail silence
-    reduce(vcat, parts)
+    len = 3dit
+    @inbounds for i in pos:pos+len-1; out[i] = 0f0; end
+    pos += len
+
+    resize!(out, pos - 1)
+    out
 end
