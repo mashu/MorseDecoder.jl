@@ -18,10 +18,14 @@ using Random
 
 # ─── Vocab and constants ─────────────────────────────────────────────────────
 
-"""Vocabulary size: chars + start + padding token."""
-const VOCAB_SIZE = NUM_CHARS + 2
+"""Vocabulary size: chars + start + pad + end-of-sequence."""
+const VOCAB_SIZE = NUM_CHARS + 3
 const START_TOKEN_IDX = NUM_CHARS + 1
-const PAD_TOKEN_IDX = NUM_CHARS + 2  # padding in decoder input/target; mask in loss
+const PAD_TOKEN_IDX = NUM_CHARS + 2   # padding in batch; mask in loss
+# EOS = "no more content for this slot (in this chunk)" — e.g. silence, end of exchange, or end of buffer.
+# Not "station left the band": one calling station can have many short exchanges (73 with A, then B, …);
+# each chunk may show one exchange; EOS stops decoding until the next chunk has new content.
+const EOS_TOKEN_IDX = NUM_CHARS + 3
 
 # ─── Encoder ─────────────────────────────────────────────────────────────────
 
@@ -208,9 +212,9 @@ end
     multi_station_cross_entropy(logits, decoder_target, station_mask; pad_idx)
 
 Logits (vocab, seq, batch×K), decoder_target (seq, batch×K), station_mask (batch×K).
-Mean cross-entropy over valid (b,k) positions only. PAD is always masked out (batch
-alignment only; not content). Space is a content token in the alphabet (ALPHABET
-includes ' '); the model predicts it for word gaps / long pauses between characters.
+Mean cross-entropy over valid (b,k) positions only. PAD is masked out (batch alignment).
+EOS is not masked — the model is trained to predict EOS after the last character so it
+learns when to stop (alignment with encoder content/silence).
 """
 function multi_station_cross_entropy(
     logits::AbstractArray{T,3},
@@ -274,8 +278,8 @@ train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
 """
     decode_autoregressive(model, spec, n_stations; max_len, start_token, to_device)
 
-Decode up to `n_stations` transcripts from one spectrogram. No mutations: buffers are created
-via to_device (e.g. pass to_device=gpu so ids stay on GPU). Returns (max_len, n_stations) token indices.
+Decode up to `n_stations` transcripts from one spectrogram. Stops early when every station
+has emitted EOS (or at max_len). Returns (seq_len, n_stations) token indices.
 to_device(x) should place x on the same device as spec (e.g. Flux.gpu or Flux.cpu); default identity.
 """
 function decode_autoregressive(
@@ -288,22 +292,24 @@ function decode_autoregressive(
 )
     memory = model.encoder(spec)
     memory_rep = repeat_memory_for_stations(memory, n_stations)
-    # Pure: create on CPU then place on device via to_device (no fill!/copyto!)
     station_ids = to_device(reshape(collect(1:n_stations), 1, n_stations))
     ids_so_far = to_device(fill(start_token, 1, n_stations))
+    done_per_station = falses(n_stations)
 
-    # Mask out PAD and START so we never decode them (avoids empty output when model predicts alignment tokens).
     for _ in 2:max_len
         logits = model.decoder(ids_so_far, memory_rep, station_ids)
         next_logits = selectdim(logits, 2, size(logits, 2))
-        # argmax on CuArray triggers invalid LLVM IR; copy slice to CPU, argmax, then back via to_device
         next_logits_cpu = Array(next_logits)
         next_logits_cpu[PAD_TOKEN_IDX, :] .= -1f10
         next_logits_cpu[START_TOKEN_IDX, :] .= -1f10
         am = argmax(next_logits_cpu; dims=1)
         next_ids_cpu = reshape(map(i -> i[1], am), 1, n_stations)
+        for k in 1:n_stations
+            next_ids_cpu[1, k] == EOS_TOKEN_IDX && (done_per_station[k] = true)
+        end
         next_ids = to_device(next_ids_cpu)
         ids_so_far = cat(ids_so_far, next_ids; dims=1)
+        all(done_per_station) && break
     end
 
     ids_so_far

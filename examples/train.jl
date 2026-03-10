@@ -168,11 +168,11 @@ function run_decode_one(model, batch, device, n_stations, max_len)
     end
 end
 
-"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, stop at PAD/START/0."""
+"""Turn decoded token id sequence into a string: chars 1:NUM_CHARS, stop at EOS/PAD/START/0."""
 function token_ids_to_string(ids::AbstractVector{<:Integer})
     buf = Char[]
     for i in ids
-        (i == PAD_TOKEN_IDX || i == 0) && break
+        (i == EOS_TOKEN_IDX || i == PAD_TOKEN_IDX || i == 0) && break
         i == START_TOKEN_IDX && continue
         1 <= i <= NUM_CHARS && push!(buf, IDX_TO_CHAR[i])
     end

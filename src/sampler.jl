@@ -115,7 +115,8 @@ function collate(samples::AbstractVector{Sample})
     B        = length(samples)
     max_ns   = maximum(s.n_stations for s in samples)
     max_time = maximum(size(s.spectrogram, 2) for s in samples)
-    max_seq  = maximum(maximum(length(t) for t in s.texts) for s in samples)
+    # Each target is [chars...] + EOS; padding follows. So max_seq = max content length + 1.
+    max_seq  = maximum(maximum(length(encode_text(t)) + 1 for t in s.texts) for s in samples)
     n_bins   = size(first(samples).spectrogram, 1)
 
     spec_batch = zeros(Float32, n_bins, B, max_time)
@@ -131,7 +132,7 @@ function collate(samples::AbstractVector{Sample})
         in_lens[b]  = T
         ns_vec[b]   = s.n_stations
         for k in 1:s.n_stations
-            enc = encode_text(s.texts[k])
+            enc = [encode_text(s.texts[k]); EOS_TOKEN_IDX]
             L   = length(enc)
             tgt_batch[b, k, 1:L] .= enc
             tgt_lens[b, k] = L

@@ -142,6 +142,18 @@ end
 
 For long files, a simpler approach is to generate several `random_band` scenes and concatenate their `scene.audio` and collect `scene.texts` into a single transcript file (e.g. with time offsets if you track durations).
 
+## Real-time decoding: new stations and ended conversations
+
+In real time, new stations can start and previous conversations can end. The model does **not** need to change for this.
+
+- **Fixed slots:** Decode with a fixed `max_stations` (e.g. 3–5) every chunk. Each slot outputs a transcript and can emit **EOS** when there is no more content for that slot in this chunk (silence, end of exchange, or end of buffer). EOS means “stop decoding this slot for now”, not “this station left the band” — e.g. a calling station can have many short exchanges (73 with A, then with B, …); in each chunk you get one segment and EOS when they pause.
+- **New stations:** There is no persistent “station id” across chunks. Each chunk you run the encoder on the **current** buffer and decode the same N slots. So:
+  - **Slot assignment:** Assign slots to “who is on the band” each time (e.g. by frequency: slot 1 = lowest active carrier, slot 2 = next, …). Then when someone ends (EOS) and someone new appears, the next chunk can show the new station in one of the slots (e.g. the slot that was just freed).
+  - The decoder sees only the current spectrogram; it has no memory of “slot 2 ended last time”. So you run `decode_autoregressive(model, spec, n_stations)` on the current buffer and get fresh transcripts per slot. A new message is simply “new content in that slot” on the next run.
+- **Practical flow:** (1) Buffer the last K seconds of audio. (2) Compute spectrogram, run encoder + decoder with `max_stations`. (3) For each slot: if output ends with EOS, treat that conversation as complete (e.g. show and optionally clear that slot for display). (4) Repeat on the next chunk. No need to “reset” a slot in the model; when a new carrier appears and you assign it to a slot (e.g. by frequency), the next decode will produce that station’s message in that slot.
+
+So: **ended = EOS; new station = new content in a slot on the next chunk**, with slot assignment (e.g. by current active carriers) done in your real-time app.
+
 ## Layout
 
 | File            | Role                                      |
