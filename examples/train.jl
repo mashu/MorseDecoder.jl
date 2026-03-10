@@ -28,6 +28,12 @@ accum_grad(a::AbstractArray{T,N}, b::AbstractArray{T,N}) where {T,N} = add!!(a, 
 accum_grad(a::N, b::N) where N<:Number = add!!(a, b)
 accum_grad(a, b) = a  # fallback for Nothing / other leaf types
 
+"""Total number of trainable parameters in the model (for capacity logging)."""
+function count_parameters(model)
+    # Flux.params(model) collects all parameter arrays; sum their lengths
+    sum(length, Flux.params(model))
+end
+
 """Encoder dropout for this step: 0 until schedule_start, then encoder_dropout_max. Use schedule_start=0 to disable."""
 function effective_encoder_dropout(step::Int, args)
     args.encoder_dropout_schedule_start <= 0 && return Float64(args.encoder_dropout)
@@ -83,11 +89,11 @@ function parse_commandline()
         "--dim"
         help = "Model dimension (encoder and decoder)"
         arg_type = Int
-        default = 128
+        default = 256
         "--n-layers"
         help = "Number of encoder/decoder layers (min 5 for RoPE)"
         arg_type = Int
-        default = 6
+        default = 8
         "--n-heads"
         help = "Number of attention heads"
         arg_type = Int
@@ -128,7 +134,7 @@ function parse_commandline()
       benchmark = parsed["benchmark"])
 end
 
-function build_model(n_bins::Int; dim=128, n_heads=4, n_layers=2, max_stations::Int=5)
+function build_model(n_bins::Int; dim=256, n_heads=4, n_layers=8, max_stations::Int=5)
     encoder = SpectrogramEncoder(n_bins, dim, n_heads, n_layers)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, n_layers; max_stations)
     SpectrogramEncoderDecoder(encoder, decoder)
@@ -363,7 +369,8 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
     n_val_stations = min(2, minimum(maximum(b.n_stations) for b in val_batches))
 
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
+    n_params = count_parameters(model)
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers n_heads=args.n_heads n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
