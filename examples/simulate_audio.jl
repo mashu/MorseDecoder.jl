@@ -14,7 +14,7 @@ function main()
 
     # Spectrogram config: 200–800 Hz band, nfft/hop tuned for model input
     # (enough time/freq resolution, compact so the heatmap array stays manageable)
-    spec_cfg = SpectrogramConfig(; nfft=512, hop=128, freq_lo=200f0, freq_hi=800f0)
+    spec_cfg = SpectrogramConfig(; freq_lo=200f0, freq_hi=800f0)  # default nfft=1024 for ~10 Hz resolution
 
     # Save audio
     wavpath = "$prefix.wav"

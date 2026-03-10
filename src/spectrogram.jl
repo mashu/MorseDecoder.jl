@@ -5,6 +5,12 @@ Produces a (freq_bins × time_frames) matrix: one column per hop, only the
 bins in [freq_lo, freq_hi] Hz.  We never feed the full FFT (e.g. 257 bins);
 for Morse (200–800 Hz) using 100–900 Hz keeps freq_bins small and saves memory.
 This is the input representation for the decoder network.
+
+- Frequency: sr/nfft Hz per bin. Default nfft=1024 at 8 kHz → ~7.8 Hz, so stations
+  10 Hz apart (pile-up "up 10" / "down 10") are resolvable.
+- Time: one frame every hop/sr seconds. Default hop=64 → 8 ms per frame; at 50 WPM
+  a dit is ~24 ms so we get ~3 frames per dit (dah ~9 frames), enough to resolve
+  dits and dashes reliably. hop=128 would give only ~1.5 frames/dit at 50 WPM.
 """
 
 using FFTW: plan_rfft
@@ -20,7 +26,8 @@ struct SpectrogramConfig
     max_frames::Union{Int,Nothing}
 end
 
-SpectrogramConfig(; nfft=512, hop=128, freq_lo=200f0, freq_hi=800f0, max_frames=nothing) =
+# nfft=1024 → ~7.8 Hz; hop=64 → 8 ms/frame, ~3 frames/dit at 50 WPM for reliable dit/dash
+SpectrogramConfig(; nfft=1024, hop=64, freq_lo=200f0, freq_hi=800f0, max_frames=nothing) =
     SpectrogramConfig(nfft, hop, freq_lo, freq_hi, max_frames)
 
 """Number of frequency bins in the configured band for sample rate `sr`."""
