@@ -21,16 +21,19 @@ A single training example: spectrogram + per-station labels.
 
 Fields:
 - `spectrogram`  : (freq_bins × time_frames)  — network input
-- `texts`        : one String per station      — target labels
+- `texts`        : one String per station      — target labels (or per-speaker when turns is set)
 - `frequencies`  : carrier Hz per station      — auxiliary info for the model
 - `n_stations`   : number of active stations
+- `turns`        : optional [(speaker, text), ...]. When set, collate uses turn order for target.
 """
 struct Sample
     spectrogram::Matrix{Float32}
     texts::Vector{String}
     frequencies::Vector{Float32}
     n_stations::Int
+    turns::Union{Nothing, Vector{Tuple{Int,String}}}
 end
+Sample(spec, texts, freqs, n_stations) = Sample(spec, texts, freqs, n_stations, nothing)
 
 """
 Configuration for the training data sampler.
@@ -44,6 +47,7 @@ struct SamplerConfig
     amp_range::Tuple{Float32,Float32}
     noise_range::Tuple{Float32,Float32}
     spec::SpectrogramConfig
+    contest_fraction::Float32  # fraction of samples that are contest (turn-ordered); 0 = only random_band
 end
 
 SamplerConfig(;
@@ -55,17 +59,40 @@ SamplerConfig(;
     amp_range        = (0.3f0, 1.0f0),
     noise_range      = (0.005f0, 0.08f0),
     spec             = SpectrogramConfig(),
+    contest_fraction = 0.0f0,
 ) = SamplerConfig(n_stations_range, sr, freq_range, wpm_range,
-                  jitter_range, amp_range, noise_range, spec)
+                  jitter_range, amp_range, noise_range, spec, contest_fraction)
 
 """
     generate_sample(cfg; rng, text_fn) → Sample
 
 Produce one training sample: a random band scene → spectrogram + labels.
+With cfg.contest_fraction > 0, that fraction of samples are contest-style
+turn-ordered conversations (CQ → hunter → runner TU 73 …) so the model sees
+realistic exchange order and patterns (DE, K, TU 73).
 """
 function generate_sample(cfg::SamplerConfig;
                          rng::AbstractRNG = Random.default_rng(),
                          text_fn::Function = random_text)
+    use_contest = cfg.contest_fraction > 0 && rand(rng, Float32) < cfg.contest_fraction
+    if use_contest
+        n_responders = 1 + rand(rng, 0:2)  # 2–4 stations total
+        scene = random_contest_conversation_band(rng;
+            n_responders   = n_responders,
+            sr             = cfg.sr,
+            freq_range     = cfg.freq_range,
+            wpm_range      = cfg.wpm_range,
+            jitter_range   = cfg.jitter_range,
+            amp_range      = cfg.amp_range,
+            noise_range    = cfg.noise_range,
+            gap_ms         = 100f0 + 100f0 * rand(rng),
+            responder_overlap_ms = rand(rng) < 0.4 ? 50f0 + 150f0 * rand(rng) : 0f0,
+        )
+        spec  = compute_spectrogram(scene.audio, scene.sr, cfg.spec)
+        freqs = Float32[s.frequency for s in scene.stations]
+        return Sample(spec, scene.texts, freqs, length(scene.stations), scene.turns)
+    end
+
     scene = random_band(rng;
         n_stations   = rand(rng, cfg.n_stations_range),
         sr           = cfg.sr,
@@ -79,7 +106,7 @@ function generate_sample(cfg::SamplerConfig;
     spec  = compute_spectrogram(scene.audio, scene.sr, cfg.spec)
     freqs = Float32[s.frequency for s in scene.stations]
 
-    Sample(spec, scene.texts, freqs, length(scene.stations))
+    Sample(spec, scene.texts, freqs, length(scene.stations), nothing)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,13 +144,21 @@ function collate(samples::AbstractVector{Sample})
     max_time = maximum(size(s.spectrogram, 2) for s in samples)
     n_bins   = size(first(samples).spectrogram, 1)
 
-    # Build interleaved target per sample and get max_seq
+    # Build interleaved target per sample and get max_seq (turn order when s.turns is set)
     target_seqs = Vector{Vector{Int}}(undef, B)
     for (b, s) in enumerate(samples)
         enc = Int[]
-        for k in 1:min(s.n_stations, MAX_SPEAKERS)
-            push!(enc, speaker_token_id(k))
-            append!(enc, encode_text(s.texts[k]))
+        if s.turns !== nothing && !isempty(s.turns)
+            for (spk, txt) in s.turns
+                spk_id = min(spk, MAX_SPEAKERS)
+                push!(enc, speaker_token_id(spk_id))
+                append!(enc, encode_text(txt))
+            end
+        else
+            for k in 1:min(s.n_stations, MAX_SPEAKERS)
+                push!(enc, speaker_token_id(k))
+                append!(enc, encode_text(s.texts[k]))
+            end
         end
         push!(enc, EOS_TOKEN_IDX)
         target_seqs[b] = enc

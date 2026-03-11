@@ -18,7 +18,9 @@ function main()
     rng = MersenneTwister(42)
 
     # Contest-style: one runner calling CQ and working 2–4 responders in sequence.
-    scene = random_contest_conversation_band(rng; n_responders=2 + rand(rng, 0:2), sr=8000)
+    # Optional overlap: hunters sometimes start before runner finishes "CQ ... K".
+    responder_overlap_ms = rand(rng) < 0.5 ? 80f0 + 120f0 * rand(rng) : 0f0  # 0 or ~80–200 ms
+    scene = random_contest_conversation_band(rng; n_responders=2 + rand(rng, 0:2), sr=8000, responder_overlap_ms=responder_overlap_ms)
     spec_cfg = SpectrogramConfig(; freq_lo=100f0, freq_hi=900f0)  # same as train.jl
 
     # Save audio
@@ -35,7 +37,7 @@ function main()
         join(("[$(k)] $(scene.texts[k])" for k in 1:length(scene.texts)), " ")
     end
     open(txtpath, "w") do io
-        println(io, "Contest-style: 1 runner + $(length(scene.stations)-1) responders, turn-based (no overlap).")
+        println(io, "Contest-style: 1 runner + $(length(scene.stations)-1) responders, turn-based.")
         println(io, "")
         for (i, (st, txt)) in enumerate(zip(scene.stations, scene.texts))
             line = "Station $i @ $(round(st.frequency; digits=1)) Hz (WPM $(round(st.wpm; digits=0))): $txt"

@@ -73,7 +73,7 @@ export
     Station, synthesize,
 
     # Messages
-    random_callsign, random_message, random_text,
+    random_callsign, random_message, random_text, contest_turns,
 
     # Band mixing
     BandScene, mix_stations, random_band, mix_conversation, random_conversation_band, random_contest_conversation_band,

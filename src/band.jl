@@ -62,30 +62,66 @@ end
 # ─── Turn-based conversation ────────────────────────────────────────────────
 
 """
-    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ) → BandScene
+    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ, responder_overlap_ms) → BandScene
 
 Mix a **conversation**: stations take turns. `turns` is a vector of (speaker_index, text)
-with speaker_index in 1:length(stations). Each segment is synthesized and placed in time
-one after another (optional gap between turns). Only the current speaker keys; no overlap.
+with speaker_index in 1:length(stations). Each segment is synthesized and placed in time.
+
+- **gap_ms**: pause between turns (can be negative for overlap).
+- **responder_overlap_ms**: when the next turn is from a responder (speaker ≥ 2) and the
+  previous was the runner (speaker 1), start the responder this many ms *before* the
+  previous turn ends — simulates hunters calling before the runner finishes "CQ ... K".
 """
 function mix_conversation(stations::AbstractVector{Station},
                           turns::AbstractVector{Tuple{Int,String}},
                           sr::Int, rng::AbstractRNG;
                           gap_ms::Real = 200f0,
-                          noise_σ::Float32 = 0.02f0)
+                          noise_σ::Float32 = 0.02f0,
+                          responder_overlap_ms::Real = 0f0)
     isempty(turns) && return BandScene(Float32[], collect(stations), ["" for _ in stations], sr, nothing)
-    gap_samples = max(0, round(Int, sr * gap_ms / 1000))
+    gap_samples = round(Int, sr * gap_ms / 1000)
+    overlap_samples = max(0, round(Int, sr * responder_overlap_ms / 1000))
 
     # First pass: synthesize each turn
     turn_audios = [synthesize(stations[t[1]], t[2], sr, rng) for t in turns]
-    total_len = sum(length, turn_audios) + gap_samples * (length(turns) - 1)
+
+    # Compute total length (overlap can make next turn start earlier)
+    offset = 1
+    total_len = 0
+    for i in 1:length(turn_audios)
+        n = length(turn_audios[i])
+        if i > 1
+            prev_spk = turns[i - 1][1]
+            spk = turns[i][1]
+            if spk != 1 && prev_spk == 1 && overlap_samples > 0
+                offset = max(1, offset - overlap_samples)
+            else
+                offset += gap_samples
+            end
+        end
+        total_len = max(total_len, offset + n - 1)
+        offset += n
+    end
     mixed = zeros(Float32, total_len)
 
     offset = 1
     for (i, a) in enumerate(turn_audios)
         n = length(a)
-        @views mixed[offset:offset + n - 1] .+= a
-        offset += n + gap_samples
+        if i > 1
+            prev_spk = turns[i - 1][1]
+            spk = turns[i][1]
+            if spk != 1 && prev_spk == 1 && overlap_samples > 0
+                offset = max(1, offset - overlap_samples)
+            else
+                offset += gap_samples
+            end
+        end
+        last = min(offset + n - 1, total_len)
+        len_actual = last - offset + 1
+        if len_actual > 0
+            @views mixed[offset:last] .+= a[1:len_actual]
+        end
+        offset += n
     end
 
     if noise_σ > 0f0
@@ -157,7 +193,8 @@ function random_contest_conversation_band(rng::AbstractRNG;
                                          jitter_range::Tuple = (0.08f0, 0.25f0),
                                          amp_range::Tuple = (0.3f0, 1.0f0),
                                          noise_range::Tuple = (0.005f0, 0.08f0),
-                                         gap_ms::Real = 150f0)
+                                         gap_ms::Real = 150f0,
+                                         responder_overlap_ms::Real = 0f0)
     n_stations = 1 + max(1, n_responders)
     freqs = spread_frequencies(rng, n_stations, freq_range)
     stations = [Station(;
@@ -171,7 +208,7 @@ function random_contest_conversation_band(rng::AbstractRNG;
     turns = contest_turns(rng, runner_call, n_responders)
 
     noise_σ = uniform_float(rng, noise_range...)
-    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ)
+    mix_conversation(stations, turns, sr, rng; gap_ms, noise_σ, responder_overlap_ms)
 end
 
 # ─── Random band generation ─────────────────────────────────────────────────
