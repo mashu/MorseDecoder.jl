@@ -1,3 +1,4 @@
+
 """
     model.jl — Spectrogram encoder–decoder with cross-attention (Onion + Flux).
 
@@ -244,7 +245,7 @@ function prepare_training_batch(batch::Batch)
 end
 
 """
-    train_step(model, spec, decoder_input, decoder_target; encoder_dropout, rng)
+    train_step(model, spec, decoder_input, decoder_target; encoder_dropout)
 
 Single training step. 100% teacher forcing: decoder input is always ground truth.
 """
@@ -254,10 +255,9 @@ function train_step(
     decoder_input,
     decoder_target;
     encoder_dropout::Real = 0.0,
-    rng = Random.default_rng(),
 )
     memory = model.encoder(spec)
-    if encoder_dropout > 0 && rand(rng, Float32) < encoder_dropout
+    if encoder_dropout > 0 && rand(Float32) < encoder_dropout
         memory = memory .* 0f0
     end
     logits = model.decoder(decoder_input, memory)

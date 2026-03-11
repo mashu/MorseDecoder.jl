@@ -34,12 +34,6 @@ function count_parameters(model)
     length(flat)
 end
 
-"""Encoder dropout for this step: 0 until schedule_start, then encoder_dropout_max. Use schedule_start=0 to disable."""
-function effective_encoder_dropout(step::Int, args)
-    args.encoder_dropout_schedule_start <= 0 && return Float64(args.encoder_dropout)
-    step >= args.encoder_dropout_schedule_start ? Float64(args.encoder_dropout_max) : 0.0
-end
-
 function parse_commandline()
     s = ArgParseSettings(
         description = "Train spectrogram encoder–decoder for multi-station Morse. Checkpoints (model + optimiser) saved in checkpoint-dir; resume by re-running with same dir.",
@@ -111,17 +105,9 @@ function parse_commandline()
         arg_type = Float64
         default = 0.1
         "--encoder-dropout"
-        help = "Fixed prob of zeroing encoder output per step (0 = off). Overridden by --encoder-dropout-schedule when used."
+        help = "Fixed dropout on encoder output (same for whole training, default 0.1)"
         arg_type = Float64
-        default = 0.0
-        "--encoder-dropout-schedule-start"
-        help = "Step at which to start gradual encoder dropout (0 = disabled; then encoder dropout ramps to --encoder-dropout-max)."
-        arg_type = Int
-        default = 5000
-        "--encoder-dropout-max"
-        help = "Max encoder dropout when using schedule (e.g. 0.05 after 5K steps)."
-        arg_type = Float64
-        default = 0.05
+        default = 0.1
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
@@ -141,8 +127,6 @@ function parse_commandline()
       dim = parsed["dim"], encoder_layers, decoder_layers, cross_layers, n_heads = parsed["n-heads"],
       decoder_input_dropout = parsed["decoder-input-dropout"],
       encoder_dropout = parsed["encoder-dropout"],
-      encoder_dropout_schedule_start = parsed["encoder-dropout-schedule-start"],
-      encoder_dropout_max = parsed["encoder-dropout-max"],
       benchmark = parsed["benchmark"])
 end
 
@@ -242,7 +226,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
         decoder_target = device(decoder_target)
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = 0.0, rng = rng) / args.accum_steps
+                encoder_dropout = 0.0) / args.accum_steps
         end
         if grads_accum === nothing
             grads_accum = result.grad[1]
@@ -278,7 +262,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
         t0 = time()
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = 0.0, rng = rng) / args.accum_steps
+                encoder_dropout = 0.0) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
 
@@ -337,9 +321,6 @@ end
 function main()
     args = parse_commandline()
     rng = MersenneTwister(42)
-    # RNG for train_step (dropout, scheduled sampling): same backend as model so no CPU transfer
-    step_rng = args.gpu ? CUDA.default_rng() : rng
-    args.gpu && Random.seed!(step_rng, 42)
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
@@ -415,7 +396,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout encoder_dropout=args.encoder_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -456,10 +437,9 @@ function main()
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
 
-        enc_drop = effective_encoder_dropout(step, args)
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = enc_drop, rng = step_rng) / args.accum_steps
+                encoder_dropout = args.encoder_dropout) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
