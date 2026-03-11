@@ -79,9 +79,9 @@ function parse_commandline()
         arg_type = Float32
         default = 3f-4
         "--warmup-fraction"
-        help = "Fraction of steps for LR warmup (0 = constant LR). Default 0.1, capped at 2000 steps. One-cycle then cosine decay to lr/100."
+        help = "Fraction of steps for LR warmup (0 = constant LR). Capped at 1000 steps for small models. One-cycle then cosine decay to lr/100."
         arg_type = Float64
-        default = 0.1
+        default = 0.01
         "--decode-every"
         help = "Run decode on fixed val every N steps (0 = only at end)"
         arg_type = Int
@@ -89,19 +89,27 @@ function parse_commandline()
         "--dim"
         help = "Model dimension (encoder and decoder)"
         arg_type = Int
-        default = 256
-        "--n-layers"
-        help = "Number of encoder/decoder layers (min 5 for RoPE)"
+        default = 128
+        "--encoder-layers"
+        help = "Number of encoder (self-attention) layers (min 5 for RoPE)"
         arg_type = Int
         default = 8
+        "--decoder-layers"
+        help = "Decoder blocks (each = self-attn + cross-attn interleaved). 2 = 4 layers total (2 self + 2 cross)."
+        arg_type = Int
+        default = 2
+        "--cross-layers"
+        help = "Cross-attention layers (0 = same as decoder-layers, no extra cross-only; >0 adds extra cross-only)"
+        arg_type = Int
+        default = 0
         "--n-heads"
         help = "Number of attention heads"
         arg_type = Int
         default = 4
-        "--teacher-forcing-prob"
-        help = "Prob of using ground truth as decoder input (1.0 = standard teacher forcing; <1.0 = scheduled sampling with model predictions at that rate)."
+        "--decoder-input-dropout"
+        help = "Dropout on decoder embeddings (e.g. 0.1) to encourage cross-attention use"
         arg_type = Float64
-        default = 1.0
+        default = 0.1
         "--encoder-dropout"
         help = "Fixed prob of zeroing encoder output per step (0 = off). Overridden by --encoder-dropout-schedule when used."
         arg_type = Float64
@@ -122,21 +130,26 @@ function parse_commandline()
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
     batch_size = parsed["gpu"] ? parsed["batch"] : (parsed["batch"] == 64 ? 8 : parsed["batch"])
-    n_layers = max(5, parsed["n-layers"])
+    encoder_layers = max(5, parsed["encoder-layers"])
+    decoder_layers = max(1, min(parsed["decoder-layers"], encoder_layers))
+    cross_layers_raw = parsed["cross-layers"]
+    cross_layers = (cross_layers_raw == 0 ? decoder_layers : max(decoder_layers, cross_layers_raw))
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
       accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
       lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], decode_every = parsed["decode-every"],
-      dim = parsed["dim"], n_layers, n_heads = parsed["n-heads"],
-      teacher_forcing_prob = parsed["teacher-forcing-prob"], encoder_dropout = parsed["encoder-dropout"],
+      dim = parsed["dim"], encoder_layers, decoder_layers, cross_layers, n_heads = parsed["n-heads"],
+      decoder_input_dropout = parsed["decoder-input-dropout"],
+      encoder_dropout = parsed["encoder-dropout"],
       encoder_dropout_schedule_start = parsed["encoder-dropout-schedule-start"],
       encoder_dropout_max = parsed["encoder-dropout-max"],
       benchmark = parsed["benchmark"])
 end
 
-function build_model(n_bins::Int; dim=256, n_heads=4, n_layers=8)
-    encoder = SpectrogramEncoder(n_bins, dim, n_heads, n_layers)
-    decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, n_layers)
+function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=8, decoder_layers=2, cross_layers=2, decoder_input_dropout=0.1)
+    encoder = SpectrogramEncoder(n_bins, dim, n_heads, encoder_layers)
+    decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
+        n_cross_layers=cross_layers, decoder_input_dropout=Float32(decoder_input_dropout))
     SpectrogramEncoderDecoder(encoder, decoder)
 end
 
@@ -192,12 +205,12 @@ function token_ids_to_string(ids::AbstractVector{<:Integer})
     String(buf)
 end
 
-function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, n_layers::Int, n_heads::Int)
+function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0)
     mkpath(dirname(path))
     model_cpu = cpu(model)
     opt_cpu = cpu(opt)
     model_state = Flux.state(model_cpu)
-    jldsave(path; step, n_bins, dim, n_layers, n_heads,
+    jldsave(path; step, n_bins, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout,
             model_state, optimiser_state=opt_cpu)
     @info "checkpoint saved" step=step path=path
 end
@@ -301,21 +314,32 @@ end
 
 function load_checkpoint(path::String)
     isfile(path) || return nothing
-    jldopen(path, "r") do f
-        step = f["step"]
-        n_bins = f["n_bins"]
-        model_state = f["model_state"]
-        optimiser_state = f["optimiser_state"]
-        dim = haskey(f, "dim") ? f["dim"] : nothing
-        n_layers = haskey(f, "n_layers") ? f["n_layers"] : nothing
-        n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
-        (; step, n_bins, model_state, optimiser_state, dim, n_layers, n_heads)
+    try
+        jldopen(path, "r") do f
+            step = f["step"]
+            n_bins = f["n_bins"]
+            model_state = f["model_state"]
+            optimiser_state = f["optimiser_state"]
+            dim = haskey(f, "dim") ? f["dim"] : nothing
+            encoder_layers = haskey(f, "encoder_layers") ? f["encoder_layers"] : (haskey(f, "n_layers") ? f["n_layers"] : nothing)
+            n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
+            decoder_layers = haskey(f, "decoder_layers") ? f["decoder_layers"] : nothing
+            cross_layers = haskey(f, "cross_layers") ? f["cross_layers"] : (haskey(f, "n_cross_layers") ? f["n_cross_layers"] : nothing)
+            decoder_input_dropout = haskey(f, "decoder_input_dropout") ? f["decoder_input_dropout"] : nothing
+            (; step, n_bins, model_state, optimiser_state, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout)
+        end
+    catch e
+        @warn "Checkpoint unreadable or corrupt, starting fresh" path=path exception=e
+        return nothing
     end
 end
 
 function main()
     args = parse_commandline()
     rng = MersenneTwister(42)
+    # RNG for train_step (dropout, scheduled sampling): same backend as model so no CPU transfer
+    step_rng = args.gpu ? CUDA.default_rng() : rng
+    args.gpu && Random.seed!(step_rng, 42)
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
@@ -326,12 +350,18 @@ function main()
 
     loaded = load_checkpoint(checkpoint_path)
     step_start = 1
+    decoder_layers = args.decoder_layers
+    cross_layers = args.cross_layers
+    decoder_input_dropout = args.decoder_input_dropout
     if loaded !== nothing
         d = loaded
         dim = something(get(d, :dim, nothing), args.dim)
-        n_layers = something(get(d, :n_layers, nothing), args.n_layers)
+        encoder_layers = something(get(d, :encoder_layers, nothing), args.encoder_layers)
         n_heads = something(get(d, :n_heads, nothing), args.n_heads)
-        model = build_model(d.n_bins; dim, n_heads, n_layers)
+        decoder_layers = something(get(d, :decoder_layers, nothing), args.decoder_layers)
+        cross_layers = something(get(d, :cross_layers, nothing), args.cross_layers)
+        decoder_input_dropout = something(get(d, :decoder_input_dropout, nothing), args.decoder_input_dropout)
+        model = build_model(d.n_bins; dim, n_heads, encoder_layers, decoder_layers, cross_layers, decoder_input_dropout)
         try
             Flux.loadmodel!(model, d.model_state)
             step_start = d.step + 1
@@ -341,26 +371,26 @@ function main()
                 model = device(model)
                 opt = device(opt)
             end
-            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim n_layers=n_layers n_heads=n_heads
+            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads
         catch e
             @warn "Checkpoint incompatible (e.g. old architecture); starting fresh" path=checkpoint_path exception=(e isa Exception ? e : nothing)
-            model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
+            model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout)
             if args.gpu
                 model = device(model)
             end
             opt = Flux.setup(Adam(args.lr), model)
         end
     else
-        model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, n_layers=args.n_layers)
+        model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout)
         if args.gpu
             model = device(model)
         end
         opt = Flux.setup(Adam(args.lr), model)
     end
 
-    # LR schedule: one-cycle (warmup then cosine decay) or constant. Good defaults: warmup capped at 2000 steps, non-zero start/end LR.
+    # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup capped for small models.
     lr_schedule = if args.warmup_fraction > 0
-        warmup_steps = min(ceil(Int, args.steps * args.warmup_fraction), 2000)
+        warmup_steps = min(ceil(Int, args.steps * args.warmup_fraction), 1000)
         percent_start = warmup_steps / args.steps
         startval = max(1f-8, args.lr / 25f0)
         endval = max(1f-9, args.lr / 100f0)
@@ -385,7 +415,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim n_layers=args.n_layers n_heads=args.n_heads n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every teacher_forcing=args.teacher_forcing_prob encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every encoder_dropout=args.encoder_dropout encoder_dropout_schedule_start=args.encoder_dropout_schedule_start encoder_dropout_max=args.encoder_dropout_max
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -429,7 +459,7 @@ function main()
         enc_drop = effective_encoder_dropout(step, args)
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = enc_drop, rng = rng) / args.accum_steps
+                encoder_dropout = enc_drop, rng = step_rng) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
@@ -455,7 +485,7 @@ function main()
                 @info "step" step=step loss=round(loss_avg; digits=4) lr=eta steps_per_sec=round(steps_per_sec; digits=2)
             end
             if step % args.save_every == 0
-                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads)
+                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
@@ -473,7 +503,7 @@ function main()
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
     if args.steps >= step_start && args.steps % args.save_every != 0
-        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, n_layers=args.n_layers, n_heads=args.n_heads)
+        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout)
     end
 
     # Final decode test on fixed validation (same as during training)

@@ -94,13 +94,26 @@ end
 # ─── Decoder (causal self-attn + cross-attn) ──────────────────────────────────
 
 """
-    SpectrogramDecoder(vocab_size, dim, n_heads, n_layers; ...)
+    SpectrogramDecoder(vocab_size, dim, n_heads, n_decoder_layers; n_cross_layers, decoder_input_dropout, ...)
 
 Single-stream autoregressive decoder: causal self-attention then cross-attention to encoder.
-Output is one sequence per spectrogram (with speaker tokens for turn order). No station_embed.
+
+**Layout (matches common audio-to-text practice, e.g. Whisper):**
+- Encoder runs alone (self-attention only over audio); it does not use cross-attention.
+- Decoder layers are **interleaved**: each of the first `n_decoder_layers` blocks is
+  [decoder self-attn] → [cross-attn to encoder output]. So cross-attention is not
+  independent; it is paired with a decoder self-attention layer.
+- If n_cross_layers > n_decoder_layers, extra **cross-only** layers run after the
+  interleaved stack (no extra decoder self-attn). This is an optional extension to
+  increase encoder reliance.
+
+- n_decoder_layers: number of decoder (self-attn) layers; each is followed by one cross-attn.
+- n_cross_layers: total cross-attention layers (>= n_decoder_layers). Extra are cross-only.
+- decoder_input_dropout: dropout on decoder embeddings (after embed).
 """
 struct SpectrogramDecoder
     embed
+    embed_dropout
     self_blocks
     cross_blocks
     norm
@@ -114,32 +127,42 @@ function SpectrogramDecoder(
     vocab_size::Int,
     dim::Int,
     n_heads::Int,
-    n_layers::Int;
+    n_decoder_layers::Int;
+    n_cross_layers::Int = n_decoder_layers,
+    decoder_input_dropout::Real = 0.0f0,
     n_kv_heads::Int = n_heads,
     ff_mult::Int = 4,
     norm_eps::Float32 = 1f-5,
     max_len::Int = 2048,
 )
+    n_cross_layers >= n_decoder_layers || throw(ArgumentError("n_cross_layers ($n_cross_layers) must be >= n_decoder_layers ($n_decoder_layers)"))
     embed = Flux.Embedding(vocab_size => dim)
-    self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
-    cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
+    embed_dropout = Flux.Dropout(Float32(decoder_input_dropout))
+    self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_decoder_layers]
+    cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_cross_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramDecoder(embed, self_blocks, cross_blocks, norm, head, rope)
+    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope)
 end
 
 function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}) where T
     h = dec.embed(decoder_input_ids)
+    h = dec.embed_dropout(h)
     seq_len = size(h, 2)
     rope_dec = dec.rope[1:seq_len]
     # Self-attn: RoPE on q and k (decoder positions, same length).
     # Cross-attn: RoPE on q only. Use identity for krope so Zygote does not accum two
     # different-length RoPE gradients (dec 44 vs enc 269) in Onion's Attention pullback.
     # Encoder positions are already contextualized by the encoder's own RoPE.
-    for (sblock, cblock) in zip(dec.self_blocks, dec.cross_blocks)
-        h = sblock(h; rope=rope_dec, krope=rope_dec, causal=true)
-        h = cblock(h, memory, memory; rope=rope_dec, krope=identity)
+    n_self = length(dec.self_blocks)
+    for i in 1:n_self
+        h = dec.self_blocks[i](h; rope=rope_dec, krope=rope_dec, causal=true)
+        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=identity)
+    end
+    # Extra cross-only layers (n_cross_layers > n_decoder_layers)
+    for i in (n_self + 1):length(dec.cross_blocks)
+        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=identity)
     end
     dec.head(dec.norm(h))
 end
@@ -223,7 +246,7 @@ end
 """
     train_step(model, spec, decoder_input, decoder_target; encoder_dropout, rng)
 
-Single training step. Single-stream decoder; no station_mask/station_ids.
+Single training step. 100% teacher forcing: decoder input is always ground truth.
 """
 function train_step(
     model::SpectrogramEncoderDecoder,
@@ -231,7 +254,7 @@ function train_step(
     decoder_input,
     decoder_target;
     encoder_dropout::Real = 0.0,
-    rng::AbstractRNG = Random.default_rng(),
+    rng = Random.default_rng(),
 )
     memory = model.encoder(spec)
     if encoder_dropout > 0 && rand(rng, Float32) < encoder_dropout
