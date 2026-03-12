@@ -5,7 +5,8 @@
 - Single-stream decoder: one output sequence per spectrogram, with speaker tokens
   (SPEAKER_1 … SPEAKER_6) so turn order is preserved. No fixed N slots; decode until EOS.
 - Encoder: full self-attention over time. Decoder: causal self-attention + cross-attention to encoder.
-- Loss: masked CE over sequence (PAD masked). Caller moves data to GPU.
+- Optional CTC head on encoder output for streaming / joint CTC-attention training.
+- Loss: masked CE over sequence (PAD masked) + optional CTC loss. Caller moves data to GPU.
 """
 
 using Flux
@@ -18,6 +19,10 @@ using Random
 # VOCAB_SIZE, START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX, SPEAKER_1_IDX..SPEAKER_6_IDX,
 # TS_TOKEN_IDX, TE_TOKEN_IDX, speaker_token_id, is_speaker_token are defined in vocab.jl.
 # Decoder logits size = VOCAB_SIZE (chars + <START> + PAD + <END> + [S1]..[S6] + [TS] + [TE]).
+
+# CTC blank token is appended after VOCAB_SIZE (NNlib convention: blank = last class).
+const CTC_VOCAB_SIZE = VOCAB_SIZE + 1
+const CTC_BLANK_IDX  = CTC_VOCAB_SIZE
 
 # ─── Encoder ─────────────────────────────────────────────────────────────────
 
@@ -163,13 +168,16 @@ end
 # ─── Full model ───────────────────────────────────────────────────────────────
 
 """
-    SpectrogramEncoderDecoder(encoder, decoder)
+    SpectrogramEncoderDecoder(encoder, decoder, ctc_head)
 
 Full model: encoder maps spectrogram to memory; decoder maps (decoder_input_ids, memory) to logits.
+`ctc_head` (Dense) projects encoder output to CTC vocabulary (VOCAB_SIZE + blank) for
+joint CTC/attention training and streaming inference.
 """
 struct SpectrogramEncoderDecoder
     encoder::SpectrogramEncoder
     decoder::SpectrogramDecoder
+    ctc_head::Dense   # encoder output → CTC logits (CTC_VOCAB_SIZE)
 end
 
 Flux.@layer SpectrogramEncoderDecoder
@@ -226,6 +234,24 @@ function sequence_cross_entropy(
     sum(nll .* valid) / total_valid
 end
 
+# ─── CTC target preparation ──────────────────────────────────────────────────
+
+"""
+    prepare_ctc_targets(batch::Batch) -> Vector{Vector{Int}}
+
+Extract CTC label sequences from a Batch. Strips START, PAD, EOS (decoder-only tokens);
+keeps characters, speaker tokens, [TS], [TE]. Each element is a variable-length Vector{Int}.
+"""
+function prepare_ctc_targets(batch::Batch)
+    B = size(batch.targets, 1)
+    ctc_targets = Vector{Vector{Int}}(undef, B)
+    for b in 1:B
+        tgt = @view batch.targets[b, 1:batch.target_lengths[b]]
+        ctc_targets[b] = [t for t in tgt if t != START_TOKEN_IDX && t != PAD_TOKEN_IDX && t != EOS_TOKEN_IDX && t != 0]
+    end
+    ctc_targets
+end
+
 # ─── Training step (one batch) ───────────────────────────────────────────────
 
 """
@@ -237,9 +263,11 @@ function prepare_training_batch(batch::Batch)
 end
 
 """
-    train_step(model, spec, decoder_input, decoder_target; encoder_dropout)
+    train_step(model, spec, decoder_input, decoder_target; encoder_dropout, ctc_targets, input_lengths, ctc_weight)
 
-Single training step. 100% teacher forcing: decoder input is always ground truth.
+Single training step. 100% teacher forcing for decoder. When `ctc_weight > 0`,
+adds CTC loss on encoder output: `loss = CE + ctc_weight * CTC`.
+`ctc_targets` is Vector{Vector{Int}} (CPU), `input_lengths` is Vector{Int} (CPU).
 """
 function train_step(
     model::SpectrogramEncoderDecoder,
@@ -247,13 +275,21 @@ function train_step(
     decoder_input,
     decoder_target;
     encoder_dropout::Real = 0.0,
+    ctc_targets = nothing,
+    input_lengths = nothing,
+    ctc_weight::Real = 0.0f0,
 )
     memory = model.encoder(spec)
     if encoder_dropout > 0 && rand(Float32) < encoder_dropout
         memory = memory .* 0f0
     end
     logits = model.decoder(decoder_input, memory)
-    sequence_cross_entropy(logits, decoder_target)
+    loss = sequence_cross_entropy(logits, decoder_target)
+    if ctc_weight > 0 && ctc_targets !== nothing
+        ctc_logits = model.ctc_head(memory)
+        loss = loss + Float32(ctc_weight) * CTCLoss.ctc_loss_batched(ctc_logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
+    end
+    loss
 end
 
 train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
@@ -293,4 +329,34 @@ function decode_autoregressive(
     end
 
     ids_so_far
+end
+
+# ─── CTC greedy decode ───────────────────────────────────────────────────────
+
+"""
+    ctc_greedy_decode(model, spec; input_lengths) -> Vector{Vector{Int}}
+
+Run encoder + CTC head, then greedy-decode: argmax per frame, collapse consecutive
+duplicates, remove blanks. Returns one Vector{Int} of token IDs per batch element.
+"""
+function ctc_greedy_decode(
+    model::SpectrogramEncoderDecoder,
+    spec;
+    input_lengths::Vector{Int} = fill(size(spec, 3), size(spec, 2)),
+)
+    memory = model.encoder(spec)
+    ctc_logits = Array(model.ctc_head(memory))  # (CTC_VOCAB_SIZE, time, batch)
+    CTCLoss.ctc_greedy_decode(ctc_logits, input_lengths; blank = CTC_BLANK_IDX)
+end
+
+"""
+    ctc_greedy_decode(ctc_logits; input_lengths) -> Vector{Vector{Int}}
+
+Greedy CTC decode from raw logits (CTC_VOCAB_SIZE, time, batch).
+"""
+function ctc_greedy_decode(
+    ctc_logits::AbstractArray{<:Real,3};
+    input_lengths::Vector{Int} = fill(size(ctc_logits, 2), size(ctc_logits, 3)),
+)
+    CTCLoss.ctc_greedy_decode(ctc_logits, input_lengths; blank = CTC_BLANK_IDX)
 end

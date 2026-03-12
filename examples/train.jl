@@ -120,6 +120,10 @@ function parse_commandline()
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
         default = 0
+        "--ctc-weight"
+        help = "Weight for CTC loss (0 = no CTC; joint CTC/attention training, default 0.2)"
+        arg_type = Float64
+        default = 0.2
     end
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
@@ -128,6 +132,7 @@ function parse_commandline()
     decoder_layers = max(0, min(parsed["decoder-layers"], encoder_layers))
     cross_layers_raw = parsed["cross-layers"]
     cross_layers = (cross_layers_raw == 0 ? (decoder_layers == 0 ? 2 : decoder_layers) : max(decoder_layers, cross_layers_raw))
+    ctc_weight = parsed["ctc-weight"]
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
       accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
@@ -136,7 +141,8 @@ function parse_commandline()
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
       encoder_dropout = parsed["encoder-dropout"],
-      benchmark = parsed["benchmark"])
+      benchmark = parsed["benchmark"],
+      ctc_weight)
 end
 
 function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=12, decoder_layers=2, cross_layers=2, decoder_input_dropout=0.1, self_attn_residual_scale=1.0)
@@ -144,7 +150,8 @@ function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=12, decoder
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
         n_cross_layers=cross_layers, decoder_input_dropout=Float32(decoder_input_dropout),
         self_attn_residual_scale=Float32(self_attn_residual_scale))
-    SpectrogramEncoderDecoder(encoder, decoder)
+    ctc_head = Dense(dim => CTC_VOCAB_SIZE)
+    SpectrogramEncoderDecoder(encoder, decoder, ctc_head)
 end
 
 """Run decode on one spectrogram (single stream with speaker tokens); print truth vs decoded."""
@@ -169,7 +176,9 @@ function run_decode_one(model, batch, device, max_len)
     truth_s = token_ids_to_string_with_speakers(truth_ids)
     seq = [ids_cpu[i, 1] for i in 1:size(ids_cpu, 1)]
     decode_s = token_ids_to_string_with_speakers(seq)
-    @info "decode" truth=(isempty(truth_s) ? "(empty)" : truth_s) decode=(isempty(decode_s) ? "(empty)" : decode_s)
+    ctc_seqs = ctc_greedy_decode(model, test_spec; input_lengths=[batch.input_lengths[1]])
+    ctc_s = token_ids_to_string_with_speakers(ctc_seqs[1])
+    @info "decode" truth=(isempty(truth_s) ? "(empty)" : truth_s) decoder=(isempty(decode_s) ? "(empty)" : decode_s) ctc=(isempty(ctc_s) ? "(empty)" : ctc_s)
 end
 
 """Display token ids as label string (with [S1]..[S6], [TS], [TE])."""
@@ -178,13 +187,13 @@ token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer}) = token_ids_to
 """Plain text only (no special tokens)."""
 token_ids_to_string(ids::AbstractVector{<:Integer}) = token_ids_to_plain_text(ids)
 
-function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0, self_attn_residual_scale::Float64=1.0)
+function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0, self_attn_residual_scale::Float64=1.0, ctc_weight::Float64=0.0)
     mkpath(dirname(path))
     model_cpu = cpu(model)
     opt_cpu = cpu(opt)
     model_state = Flux.state(model_cpu)
     jldsave(path; step, n_bins, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale,
-            model_state, optimiser_state=opt_cpu)
+            ctc_weight, model_state, optimiser_state=opt_cpu)
     @info "checkpoint saved" step=step path=path
 end
 
@@ -306,7 +315,8 @@ function load_checkpoint(path::String)
             cross_layers = haskey(f, "cross_layers") ? f["cross_layers"] : (haskey(f, "n_cross_layers") ? f["n_cross_layers"] : nothing)
             decoder_input_dropout = haskey(f, "decoder_input_dropout") ? f["decoder_input_dropout"] : nothing
             self_attn_residual_scale = haskey(f, "self_attn_residual_scale") ? f["self_attn_residual_scale"] : nothing
-            (; step, n_bins, model_state, optimiser_state, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
+            ctc_weight = haskey(f, "ctc_weight") ? f["ctc_weight"] : 0.0
+            (; step, n_bins, model_state, optimiser_state, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, ctc_weight)
         end
     catch e
         @warn "Checkpoint unreadable or corrupt, starting fresh" path=path exception=e
@@ -350,7 +360,7 @@ function main()
                 model = device(model)
                 opt = device(opt)
             end
-            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale
+            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
         catch e
             @warn "Checkpoint incompatible (e.g. old architecture); starting fresh" path=checkpoint_path exception=(e isa Exception ? e : nothing)
             model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
@@ -394,7 +404,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale encoder_dropout=args.encoder_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale encoder_dropout=args.encoder_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -435,9 +445,16 @@ function main()
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
 
+        ctc_kws = if args.ctc_weight > 0
+            ctc_targets = prepare_ctc_targets(batch)
+            (; ctc_targets, input_lengths=batch.input_lengths, ctc_weight=Float32(args.ctc_weight))
+        else
+            (; ctc_weight=0.0f0)
+        end
+
         result = Flux.withgradient(model) do m
             train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = args.encoder_dropout) / args.accum_steps
+                encoder_dropout = args.encoder_dropout, ctc_kws...) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
@@ -463,7 +480,7 @@ function main()
                 @info "step" step=step loss=round(loss_avg; digits=4) lr=eta steps_per_sec=round(steps_per_sec; digits=2)
             end
             if step % args.save_every == 0
-                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
+                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
@@ -481,7 +498,7 @@ function main()
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
     if args.steps >= step_start && args.steps % args.save_every != 0
-        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
+        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
     end
 
     # Final decode test on fixed validation (same as during training)

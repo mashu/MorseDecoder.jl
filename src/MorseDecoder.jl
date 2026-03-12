@@ -22,6 +22,7 @@ module MorseDecoder
 using Random
 using FFTW: rfft, plan_rfft
 using CairoMakie
+using CTCLoss  # model.jl calls CTCLoss.ctc_loss_batched, CTCLoss.ctc_greedy_decode
 
 # ── Source files (order matters) ─────────────────────────────────────────────
 
@@ -59,6 +60,10 @@ export
     # Model
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
     prepare_decoder_batch, prepare_training_batch, train_step,
-    decode_autoregressive, sequence_cross_entropy
+    decode_autoregressive, sequence_cross_entropy,
+
+    # CTC (uses CTCLoss.jl; blank = CTC_BLANK_IDX)
+    CTC_VOCAB_SIZE, CTC_BLANK_IDX,
+    prepare_ctc_targets, ctc_greedy_decode
 
 end # module MorseDecoder

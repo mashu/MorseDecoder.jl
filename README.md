@@ -4,15 +4,15 @@ Training pipeline for a spectrogram encoder–decoder that decodes multi-station
 
 ## Installation
 
-**Layout:** Put the MorseSimulator repo next to this one (e.g. `MorseDecoder.jl/` and `MorseSimulator/` in the same parent folder).
+**Layout:** Put the MorseSimulator repo next to this one (e.g. `MorseDecoder.jl/` and `MorseSimulator/` in the same parent folder). CTC loss and decoding come from **[CTCLoss.jl](https://github.com/YourUsername/CTCLoss.jl)**; for local development put CTCLoss.jl next to MorseDecoder and run `] dev ../CTCLoss.jl` from the MorseDecoder project.
 
 From the MorseDecoder.jl directory:
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.add("../MorseSimulator"); Pkg.instantiate()'
+julia --project=. -e 'using Pkg; Pkg.add("../MorseSimulator"); Pkg.develop(path="../CTCLoss.jl"); Pkg.instantiate()'
 ```
 
-Or from the Julia REPL: `Pkg.activate(".")`, then `Pkg.add("../MorseSimulator")`, then `Pkg.instantiate()`.
+Or from the Julia REPL: `Pkg.activate(".")`, then `Pkg.add("../MorseSimulator")`, `Pkg.develop(path="../CTCLoss.jl")`, then `Pkg.instantiate()`.
 
 ## Quick start
 

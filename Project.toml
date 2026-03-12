@@ -5,6 +5,7 @@ version = "0.2.0"
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
+CTCLoss = "2db49016-8a32-4079-a8aa-ecf024ad7df3"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
@@ -23,6 +24,7 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
 ArgParse = "1.2.0"
+CTCLoss = "0.1"
 CUDA = "5.9.7"
 ChainRulesCore = "1.26.0"
 JLD2 = "0.6.3"
