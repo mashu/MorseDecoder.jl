@@ -105,7 +105,7 @@ function collate(samples::AbstractVector{Sample})
     ns_vec = zeros(Int, B)
     freq_batch = zeros(Float32, B, 6)
 
-    for (b, s) in enumerate(samples)
+    @inbounds for (b, s) in enumerate(samples)
         T = size(s.spectrogram, 2)
         spec_batch[:, b, 1:T] .= s.spectrogram
         in_lens[b] = T

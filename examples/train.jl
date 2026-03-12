@@ -4,8 +4,10 @@
 # Use --help for full list and defaults.
 # With --gpu, CUDA/cuDNN are loaded (before Flux) for GPU backend.
 #
-# Benchmarking: julia -t 4 --project=. examples/train.jl --gpu --benchmark 50
-#   Use -t N (N>1) so batch generation runs in parallel.
+# Benchmarking: julia -t 4 --project=. examples/train.jl --gpu --benchmark 50 [--batch 32]
+#   Use -t N (N>1) so batch generation runs in parallel. If OOM, use --batch 32.
+# GPU kernel profiling: nsys launch julia -t 4 --project=. examples/profile_gpu.jl --profile --batch 32 --steps 5
+#   Then open report.qdrep in nsight-sys to see which kernels dominate.
 
 using ArgParse
 using Logging
@@ -279,8 +281,14 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     total_ms = sum_data + sum_transfer + sum_fwbw + sum_accum
     steps_per_sec = n_steps / (total_ms / 1000)
 
-    @info "Benchmark" steps=n_steps steps_per_sec=round(steps_per_sec; digits=2)
+    data_batches_per_sec = 1000.0 / (sum_data / n_steps)  # batches/sec this benchmark would need from data
+    @info "Benchmark" steps=n_steps steps_per_sec=round(steps_per_sec; digits=2) data_must_supply_batches_per_sec=round(data_batches_per_sec; digits=2)
     @info "Timing (ms)" data=round(sum_data; digits=1) data_pct=round(100 * sum_data / total_ms; digits=1) transfer=round(sum_transfer; digits=1) transfer_pct=round(100 * sum_transfer / total_ms; digits=1) forward_backward=round(sum_fwbw; digits=1) fwbw_pct=round(100 * sum_fwbw / total_ms; digits=1) accum_update=round(sum_accum; digits=1) accum_pct=round(100 * sum_accum / total_ms; digits=1)
+    if sum_fwbw > 0.7 * total_ms
+        @info "Bottleneck" hint="GPU compute (forward+backward) dominates. To utilize GPU more: increase batch size if memory allows, or use gradient checkpointing to free memory for larger batch."
+    elseif sum_data > 0.15 * total_ms
+        @info "Bottleneck" hint="Data generation is a significant share (benchmark has no prefetch). In training, use -t N and --prefetch to overlap data with GPU; run examples/benchmark_data.jl to see batches/sec you can supply."
+    end
 end
 
 function load_checkpoint(path::String)
