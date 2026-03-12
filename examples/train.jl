@@ -93,11 +93,11 @@ function parse_commandline()
         arg_type = Int
         default = 12
         "--decoder-layers"
-        help = "Decoder self-attn layers (0 = cross-only decoder, no self-attn; each pairs with one cross-attn)"
+        help = "Decoder self-attn layers (0 = cross-only decoder; each pairs with one cross-attn, interleaved)"
         arg_type = Int
-        default = 0
+        default = 2
         "--cross-layers"
-        help = "Cross-attention layers (0 = decoder-layers or 2 if decoder-layers=0; >0 adds extra cross-only)"
+        help = "Cross-attention layers (0 = same as decoder-layers; >0 adds extra cross-only)"
         arg_type = Int
         default = 0
         "--n-heads"
@@ -139,7 +139,7 @@ function parse_commandline()
       benchmark = parsed["benchmark"])
 end
 
-function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=12, decoder_layers=0, cross_layers=2, decoder_input_dropout=0.1, self_attn_residual_scale=1.0)
+function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=12, decoder_layers=2, cross_layers=2, decoder_input_dropout=0.1, self_attn_residual_scale=1.0)
     encoder = SpectrogramEncoder(n_bins, dim, n_heads, encoder_layers)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
         n_cross_layers=cross_layers, decoder_input_dropout=Float32(decoder_input_dropout),
