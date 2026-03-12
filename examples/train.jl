@@ -9,6 +9,11 @@
 
 using ArgParse
 using Logging
+# Load CUDA/cuDNN before Flux when --gpu (must be at top level)
+if "--gpu" in ARGS
+    using CUDA
+    using cuDNN
+end
 using MorseDecoder
 using Flux
 using Optimisers: adjust!
@@ -303,11 +308,6 @@ end
 
 function main()
     args = parse_commandline()
-    if args.gpu
-        # Load GPU stack so Flux.gpu works
-        using CUDA
-        using cuDNN
-    end
     rng = MersenneTwister(42)
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")

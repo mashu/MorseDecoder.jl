@@ -47,6 +47,7 @@ export
 
     # Spectrogram (inference on WAV)
     SpectrogramConfig, compute_spectrogram, num_bins, num_frames,
+    spectrogram_to_model_scale,
 
     # Sampler (MorseSimulator)
     Sample, SamplerConfig, generate_sample,

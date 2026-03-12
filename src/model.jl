@@ -27,7 +27,8 @@ using Random
 Maps spectrogram to encoder hidden states. Conv1 → conv2 (kernel 3, pad 1) preserve time;
 no downsampling so the transformer sees full spectrogram resolution for Morse dit/dah timing.
 
-- Input: (freq_bins, batch, time) spectrogram.
+- Input: (freq_bins, batch, time) spectrogram in **log10 scale** (same as training:
+  MorseSimulator peak-norm + log10). For real audio use `spectrogram_to_model_scale` first.
 - Output: (dim, num_tokens, batch) where num_tokens = time.
 """
 struct SpectrogramEncoder
@@ -59,7 +60,8 @@ function SpectrogramEncoder(
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
-    spec = log1p.(spec)
+    # Mel from MorseSimulator is already log10(mel_energy), peak-normalized → values in (-10, 0].
+    # Whisper uses log10 mel then (log_spec + 4) / 4; we use as-is so conv/attention see the same scale.
     x = permutedims(spec, (3, 1, 2))  # (time, freq_bins, batch)
     x = enc.conv1(x)                   # (time, dim, batch)
     x = enc.conv2(x)                   # (time, dim, batch)

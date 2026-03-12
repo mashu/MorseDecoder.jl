@@ -4,13 +4,17 @@
 Produces a (freq_bins × time_frames) matrix: one column per hop, only the
 bins in [freq_lo, freq_hi] Hz.  We never feed the full FFT (e.g. 257 bins);
 for Morse (200–800 Hz) using 100–900 Hz keeps freq_bins small and saves memory.
-This is the input representation for the decoder network.
 
-- Frequency: sr/nfft Hz per bin. Default nfft=1024 at 8 kHz → ~7.8 Hz, so stations
-  10 Hz apart (pile-up "up 10" / "down 10") are resolvable.
-- Time: one frame every hop/sr seconds. Default hop=64 → 8 ms per frame; at 50 WPM
-  a dit is ~24 ms so we get ~3 frames per dit (dah ~9 frames), enough to resolve
-  dits and dashes reliably. hop=128 would give only ~1.5 frames/dit at 50 WPM.
+**Training vs real audio:** Training data from MorseSimulator is **mel** spectrogram,
+**peak-normalized** then **log10**. The encoder expects that scale. When you compute
+a spectrogram from real audio with `compute_spectrogram` you get **linear power**.
+Call `spectrogram_to_model_scale(spec)` before feeding to the model so the scale
+matches. For full match you also need 40 mel bins in 200–900 Hz (same as
+SamplerConfig / MorseSimulator); otherwise use the same bin count as your model
+was trained with.
+
+- Frequency: sr/nfft Hz per bin. Default nfft=1024 at 8 kHz → ~7.8 Hz.
+- Time: one frame every hop/sr seconds.
 """
 
 using FFTW: plan_rfft
@@ -124,4 +128,25 @@ function compute_spectrogram(audio::AbstractVector{<:Real}, sr::Int,
     end
 
     spec
+end
+
+# ─── Scale for model (match training) ─────────────────────────────────────────
+
+"""
+    spectrogram_to_model_scale(spec) → Matrix{Float32}
+
+Transform a **linear** power spectrogram to the scale the encoder expects.
+Training data (MorseSimulator) is peak-normalized then log10; this does the same.
+Use this when feeding real-audio spectrograms to the model.
+
+- `spec`: (bins × frames) linear power (e.g. from `compute_spectrogram`).
+- Returns: (bins × frames) Float32, same shape, in log10 scale like training.
+"""
+function spectrogram_to_model_scale(spec::AbstractMatrix{<:Real})
+    s = Float32.(spec)
+    peak = maximum(s)
+    if peak > 0
+        s .= s ./ peak
+    end
+    log10.(max.(s, 1f-10))
 end
