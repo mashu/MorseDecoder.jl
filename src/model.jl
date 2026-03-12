@@ -109,8 +109,12 @@ Single-stream autoregressive decoder: causal self-attention then cross-attention
   increase encoder reliance.
 
 - n_decoder_layers: number of decoder (self-attn) layers; each is followed by one cross-attn.
-- n_cross_layers: total cross-attention layers (>= n_decoder_layers). Extra are cross-only.
+  Use 0 for a **cross-only** decoder (no self-attention; Whisper-Turbo style).
+- n_cross_layers: total cross-attention layers (>= n_decoder_layers). When n_decoder_layers=0,
+  all are cross-only; must be >= 1.
 - decoder_input_dropout: dropout on decoder embeddings (after embed).
+- self_attn_residual_scale: scale applied to the residual from each decoder self-attn block
+  (default 1). Use < 1 (e.g. 0.5) to reduce reliance on decoder context and rely more on encoder.
 """
 struct SpectrogramDecoder
     embed
@@ -120,6 +124,7 @@ struct SpectrogramDecoder
     norm
     head
     rope
+    self_attn_residual_scale::Float32
 end
 
 Flux.@layer SpectrogramDecoder
@@ -131,12 +136,14 @@ function SpectrogramDecoder(
     n_decoder_layers::Int;
     n_cross_layers::Int = n_decoder_layers,
     decoder_input_dropout::Real = 0.0f0,
+    self_attn_residual_scale::Real = 1.0f0,
     n_kv_heads::Int = n_heads,
     ff_mult::Int = 4,
     norm_eps::Float32 = 1f-5,
     max_len::Int = 2048,
 )
     n_cross_layers >= n_decoder_layers || throw(ArgumentError("n_cross_layers ($n_cross_layers) must be >= n_decoder_layers ($n_decoder_layers)"))
+    (n_decoder_layers > 0 || n_cross_layers >= 1) || throw(ArgumentError("when n_decoder_layers=0, n_cross_layers must be >= 1"))
     embed = Flux.Embedding(vocab_size => dim)
     embed_dropout = Flux.Dropout(Float32(decoder_input_dropout))
     self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_decoder_layers]
@@ -144,7 +151,7 @@ function SpectrogramDecoder(
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope)
+    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope, Float32(self_attn_residual_scale))
 end
 
 function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}) where T
@@ -157,8 +164,11 @@ function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}
     # different-length RoPE gradients (dec 44 vs enc 269) in Onion's Attention pullback.
     # Encoder positions are already contextualized by the encoder's own RoPE.
     n_self = length(dec.self_blocks)
+    scale = dec.self_attn_residual_scale
     for i in 1:n_self
+        h_prev = h
         h = dec.self_blocks[i](h; rope=rope_dec, krope=rope_dec, causal=true)
+        h = h_prev .+ scale .* (h .- h_prev)
         h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=identity)
     end
     # Extra cross-only layers (n_cross_layers > n_decoder_layers)
