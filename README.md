@@ -1,22 +1,18 @@
 # MorseDecoder.jl
 
-Multi-station Morse (CW) code simulation and training data pipeline. Simulates 1–N stations transmitting simultaneously in the 200–800 Hz band, produces spectrograms as network input, and supports real-time streaming. Designed for training an encoder–decoder transformer that decodes multiple overlapping Morse signals.
+Training pipeline for a spectrogram encoder–decoder that decodes multi-station CW Morse. Uses **[MorseSimulator.jl](https://github.com/mashu/MorseSimulator.jl)** for data: mel spectrograms in the **200–900 Hz** band with ~**10 Hz** frequency resolution (to separate signals) and time resolution suitable for **50 WPM** (dots vs dashes). Labels use the simulator’s special tokens: `<START>`, `<END>`, `[S1]`…`[S6]`, `[TS]`, `[TE]`.
 
 ## Installation
 
-From the package directory:
+**Layout:** Put the MorseSimulator repo next to this one (e.g. `MorseDecoder.jl/` and `MorseSimulator/` in the same parent folder).
+
+From the MorseDecoder.jl directory:
 
 ```bash
-julia -e 'using Pkg; Pkg.activate("."); Pkg.instantiate()'
+julia --project=. -e 'using Pkg; Pkg.add("../MorseSimulator"); Pkg.instantiate()'
 ```
 
-Or from Julia:
-
-```julia
-using Pkg
-Pkg.activate("/path/to/MorseDecoder.jl")
-Pkg.instantiate()
-```
+Or from the Julia REPL: `Pkg.activate(".")`, then `Pkg.add("../MorseSimulator")`, then `Pkg.instantiate()`.
 
 ## Quick start
 
@@ -25,162 +21,82 @@ using MorseDecoder, Random
 
 rng = MersenneTwister(42)
 
-# One-shot sample (spectrogram + labels)
-cfg = SamplerConfig(n_stations_range=1:3)
-s   = generate_sample(cfg; rng)
+# SamplerConfig: 200–900 Hz mel, ~10 Hz resolution, max 512 frames (GPU-friendly)
+cfg = SamplerConfig(; max_frames=512)
+
+# One sample (spectrogram + token_ids from simulator label)
+s = generate_sample(cfg; rng)
 
 # Training batch
-batch = generate_batch(cfg, 32; rng)
-
-# Streaming (live band simulation)
-stations = [Station(frequency=f, wpm=25) for f in [350, 550, 700]]
-stream   = BandStream(stations; rng)
-spec, texts = next_chunk!(stream, 16_000)   # 2 s @ 8 kHz
-
-# Visualization
-scene = random_band(rng; n_stations=3)
-plot_band(scene, SpectrogramConfig())
+batch = generate_batch_fast(cfg, 32; rng)
+# batch.spectrogram  — (n_mels, batch, time)
+# batch.targets      — (batch, max_seq) token IDs (<START>, [S1], [TS], [TE], chars, <END>)
 ```
 
-## Simulating an audio file
+## Spectrogram and resolution
 
-You can generate a mixed CW band (multiple stations) and save it as a WAV file, together with a **transcript** of what each station sent.
+- **Band:** 200–900 Hz only (Morse CW); no need for wider bandwidth.
+- **Frequency resolution:** ~10 Hz (fft_size=4096 @ 44.1 kHz) so signals “up 10” / “down 10” are separable.
+- **Time resolution:** hop_size=256 @ 44.1 kHz (~5.8 ms/frame), enough for dots vs dashes up to 50 WPM.
 
-### 1. Generate a band scene
+Configured in `SamplerConfig()` via MorseSimulator’s `DatasetConfig` (see `src/sampler.jl`).
 
-Either use a **random** scene (stations, frequencies, speeds, and messages are random):
+### What the direct (analytic) mel path includes
 
-```julia
-using MorseDecoder, Random
+The simulator's **DirectPath** builds the mel spectrogram from Morse events without generating audio. It includes the same high-level variations as the audio path:
 
-rng = MersenneTwister(123)
-scene = random_band(rng; n_stations=3, sr=8000)
-# scene.audio  — Float32 waveform
-# scene.sr     — sample rate (Hz)
-# scene.texts  — one String per station (what each sent)
-# scene.stations — Station parameters (frequency, wpm, etc.)
-```
+| Variation | In DirectPath? | Notes |
+|-----------|----------------|--------|
+| **Speed (WPM)** | Yes | Per-transmission WPM, jitter, drift → dit/dash timing in events. |
+| **Amplitude** | Yes | Per-station `signal_amplitude` (LogNormal) → power ∝ amplitude² in mel. |
+| **SNR / noise** | Yes | `ChannelConfig(rng, scene)` from `noise_floor_db`; Gaussian (and optional impulsive) noise power added to mel. |
+| **Overlap** | Yes | Transmissions have `time_offset`; events overlap in time; all stations add into the same frames. |
+| **QSB fading** | Yes | Applied analytically per-station to frame amplitudes (same propagation params as audio path). |
+| **Frequency** | Yes | Each station has `tone_freq`; mel response is computed at that frequency. |
 
-Or define **fixed** stations and messages:
+**Caveat:** Neither path currently applies propagation **path loss** to the mixed signal: both use `station.signal_amplitude` as-is (LogNormal variation only). Impulsive noise in the direct path is added as extra constant noise power; the audio path adds actual sample-level impulses.
 
-```julia
-using MorseDecoder, Random
+## Label tokens (MorseSimulator)
 
-rng = MersenneTwister(456)
-stations = [
-    Station(frequency=400f0, wpm=25, amplitude=0.8f0),
-    Station(frequency=550f0, wpm=20, amplitude=0.6f0),
-]
-texts = ["CQ CQ DE SP1ABC SP1ABC K", "SP1ABC DE W1XYZ UR 599 73"]
-scene = mix_stations(stations, texts, 8000, rng; noise_σ=0.02f0)
-```
+Training labels are space-separated: `<START> [TS] [S1] word word [TE] [TS] [S2] ... <END>`. These are mapped to token IDs in `vocab.jl`:
 
-### 2. Save audio to WAV and transcript to a file
+- `<START>`, `<END>` (EOS)
+- `[S1]`…`[S6]` — speaker/station
+- `[TS]`, `[TE]` — transmission start/end (turn boundaries)
+- Characters (A–Z, 0–9, space, `=`, `?`)
 
-Add `WAV` if needed, then write the waveform and transcript:
+## Data throughput and real-time training
 
-```julia
-using WAV
+The simulator is used in **DirectPath** mode: no audio waveform or FFT, only analytic mel-spectrogram from Morse events. That is the fast path.
 
-# Save mixed audio
-wavwrite(scene.audio, "band.wav"; Fs=scene.sr)
+- **Per sample:** Each batch item is `BandScene → generate_transcript → encode_transcript → direct mel spectrogram`. So one sample is one scene + one transcript + numeric fill of a (n_mels × n_frames) matrix.
+- **Batching:** `generate_batch_fast(cfg, batch_size; parallel=true)` uses `Threads.@threads` to build the batch in parallel (one RNG per thread).
+- **Prefetch:** Training uses a channel of pre-generated batches (`--prefetch`, default 256) so the GPU is fed from a queue; you don’t need to generate each batch in real time as long as the producer can refill the channel fast enough.
 
-# Save transcript (one line per station: frequency and text)
-open("band_transcript.txt", "w") do io
-    for (i, (st, txt)) in enumerate(zip(scene.stations, scene.texts))
-        println(io, "Station $i @ $(st.frequency) Hz (WPM $(st.wpm)): ", txt)
-    end
-end
-```
-
-### Example transcript
-
-For a random scene you might get something like:
-
-```
-Station 1 @ 312.5 Hz (WPM 28): CQ CQ DE DL2XY DL2XY K
-Station 2 @ 512.1 Hz (WPM 22): W3AB DE JA1K RST 599 15
-Station 3 @ 698.3 Hz (WPM 35): NR 042 137
-```
-
-The transcript is the ground truth for training or for checking decoder output.
-
-**Run the example script** (produces **three files**: WAV, transcript TXT, spectrogram PNG):
+**Check if you’re data-bound:**
 
 ```bash
-julia --project=. examples/simulate_audio.jl
-# Custom prefix: julia --project=. examples/simulate_audio.jl myfile
-# → myfile.wav, myfile_transcript.txt, myfile.png
+julia --project=. examples/benchmark_data.jl 64
+julia -t 4 --project=. examples/benchmark_data.jl 64
 ```
 
-The PNG shows the waveform and a spectrogram over **200–800 Hz** using the same `SpectrogramConfig` (nfft=512, hop=128) as the model input: compact enough for language models while keeping good time/frequency resolution and avoiding artifacts.
+Compare “batches/sec” to your training steps/sec (from the “steps_per_sec” log). If batches/sec is lower, increase `--prefetch` or run with more threads (`-t N`). If it’s still too low, options are: reduce `max_frames` or batch size, or add a batch-oriented API in the simulator that reuses buffers (preallocated mel matrices, reuse of scene/transcript structures) and call that from a small “batch producer” functor here. Right now there is no such API; the benchmark tells you whether you need it.
 
-### Longer “audio file” via streaming
+## Troubleshooting
 
-To simulate a longer recording (e.g. several minutes) with continuous transmission:
-
-```julia
-using MorseDecoder, Random, WAV
-
-rng = MersenneTwister(789)
-stations = [Station(frequency=f, wpm=25) for f in [350, 550, 700]]
-stream   = BandStream(stations; rng, sr=8000)
-
-# Generate e.g. 60 seconds
-sr = 8000
-n_seconds = 60
-samples_per_chunk = 8 * 16000   # 8 s chunks
-all_audio = Float32[]
-transcript_lines = String[]
-
-for _ in 1:(n_seconds ÷ 8)
-    spec, texts = next_chunk!(stream, samples_per_chunk)
-    # Recompute mixed audio for this chunk (stream doesn't expose it directly)
-    # So for long files it's easier to use multiple random_band calls and concatenate
-end
-```
-
-For long files, a simpler approach is to generate several `random_band` scenes and concatenate their `scene.audio` and collect `scene.texts` into a single transcript file (e.g. with time offsets if you track durations).
-
-## Real-time decoding: new stations and ended conversations
-
-In real time, new stations can start and previous conversations can end. The model does **not** need to change for this.
-
-- **Fixed slots:** Decode with a fixed `max_stations` (e.g. 3–5) every chunk. Each slot outputs a transcript and can emit **EOS** when there is no more content for that slot in this chunk (silence, end of exchange, or end of buffer). EOS means “stop decoding this slot for now”, not “this station left the band” — e.g. a calling station can have many short exchanges (73 with A, then with B, …); in each chunk you get one segment and EOS when they pause.
-- **New stations:** There is no persistent “station id” across chunks. Each chunk you run the encoder on the **current** buffer and decode the same N slots. So:
-  - **Slot assignment:** Assign slots to “who is on the band” each time (e.g. by frequency: slot 1 = lowest active carrier, slot 2 = next, …). Then when someone ends (EOS) and someone new appears, the next chunk can show the new station in one of the slots (e.g. the slot that was just freed).
-  - The decoder sees only the current spectrogram; it has no memory of “slot 2 ended last time”. So you run `decode_autoregressive(model, spec, n_stations)` on the current buffer and get fresh transcripts per slot. A new message is simply “new content in that slot” on the next run.
-- **Practical flow:** (1) Buffer the last K seconds of audio. (2) Compute spectrogram, run encoder + decoder with `max_stations`. (3) For each slot: if output ends with EOS, treat that conversation as complete (e.g. show and optionally clear that slot for display). (4) Repeat on the next chunk. No need to “reset” a slot in the model; when a new carrier appears and you assign it to a slot (e.g. by frequency), the next decode will produce that station’s message in that slot.
-
-So: **ended = EOS; new station = new content in a slot on the next chunk**, with slot assignment (e.g. by current active carriers) done in your real-time app.
-
-### Drawbacks of fixed N slots
-
-- **Wasteful when fewer stations:** Decoding with `max_stations=3` but only one station active runs three decoder streams; two are empty (and may not emit EOS cleanly).
-- **No turn order:** You get “slot 1 transcript” and “slot 2 transcript” but not “caller spoke, then A, then caller, then B”. Order of who responded when is lost.
-
-### Alternative: single stream with speaker/station tokens
-
-A different design avoids both issues:
-
-- **One decoder run, one output sequence.** No fixed N slots; decode until EOS. No empty streams.
-- **Speaker tokens in the text.** Add special tokens like `<|speaker_1|>`, `<|speaker_2|>`, … (or `<|caller|>`, `<|responder|>`). The target is a single interleaved transcript, e.g.  
-  `<|s1|> CQ CQ <|s2|> AB DE XY <|s1|> TU <|s3|> CD DE XY <|endoftext|>`.  
-  Turn order is preserved; you parse the one stream into (speaker, text) segments.
-
-**What would be needed:** (1) Vocab: add speaker tokens (e.g. 5 speakers). (2) Training data: instead of N separate transcripts per sample, generate **turn-ordered** conversations (caller then A then caller then B …) and mix audio in that order; the target is the single interleaved sequence with speaker tokens. (3) Model: one decoder output per spectrogram (no `station_embed`; decoder predicts the next token including speaker tokens). (4) Inference: one decode until EOS; parse by speaker tokens. This is a larger change to the data pipeline and model but gives order and avoids wasted slots.
+- **Julia 1.11 + path dependency:** With `MorseSimulator = { path = "..." }` in `Project.toml`, `Pkg.instantiate()` can hit `TypeError: in typeassert, expected String, got a value of type Dict{String, Any}` (Julia bug in `get_uuid_name`). Workaround: instantiate once with MorseSimulator removed from `[deps]`, then add it back and run training without calling `instantiate()` again; or use Julia 1.10 and add MorseSimulator via `Pkg.develop(path="...")` from the REPL.
+- **CPU-only training:** Run without `--gpu` so CUDA/cuDNN are not loaded; default batch size is 8. Example: `julia --project=. examples/train.jl --steps 1000`.
 
 ## Layout
 
-| File            | Role                                      |
-|-----------------|-------------------------------------------|
-| `morse.jl`      | Morse table, character↔index, keying      |
-| `spectrogram.jl`| STFT → power spectrogram                  |
-| `signal.jl`     | Single-station audio synthesis            |
-| `messages.jl`   | Callsign + exchange text generators       |
-| `band.jl`       | Multi-station mixing                      |
-| `sampler.jl`    | Training samples, batching, BandStream    |
-| `viz.jl`        | CairoMakie plots                          |
+| File             | Role |
+|------------------|------|
+| `morse.jl`       | Morse table, character↔index |
+| `vocab.jl`       | Simulator label ↔ token IDs |
+| `spectrogram.jl` | STFT (e.g. for inference on real WAV) |
+| `model.jl`       | Encoder–decoder (Onion + Flux) |
+| `sampler.jl`     | MorseSimulator-based Sample/Batch |
+| `viz.jl`         | CairoMakie plots |
 
 ## License
 

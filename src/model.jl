@@ -14,30 +14,10 @@ using Onion: TransformerBlock, RoPE, RMSNorm
 using Einops: rearrange, @einops_str
 using Random
 
-# ─── Vocab and constants ─────────────────────────────────────────────────────
-
-"""Max number of speaker/station tokens (single-stream decoding with turn order)."""
-const MAX_SPEAKERS = 6
-
-"""Vocabulary size: chars + start + pad + EOS + MAX_SPEAKERS speaker tokens."""
-const VOCAB_SIZE = NUM_CHARS + 3 + MAX_SPEAKERS
-const START_TOKEN_IDX = NUM_CHARS + 1
-const PAD_TOKEN_IDX = NUM_CHARS + 2   # padding in batch; mask in loss
-# EOS = "no more content (in this chunk)".
-const EOS_TOKEN_IDX = NUM_CHARS + 3
-# Speaker tokens: who is speaking (preserves turn order). speaker_token_id(k) for k in 1..MAX_SPEAKERS.
-const SPEAKER_1_IDX = NUM_CHARS + 4
-const SPEAKER_2_IDX = NUM_CHARS + 5
-const SPEAKER_3_IDX = NUM_CHARS + 6
-const SPEAKER_4_IDX = NUM_CHARS + 7
-const SPEAKER_5_IDX = NUM_CHARS + 8
-const SPEAKER_6_IDX = NUM_CHARS + 9
-
-"""Token index for speaker k (1-based, 1 ≤ k ≤ MAX_SPEAKERS)."""
-speaker_token_id(k::Int) = NUM_CHARS + 3 + k
-
-"""True if token id is a speaker token."""
-is_speaker_token(id::Int) = (SPEAKER_1_IDX <= id <= SPEAKER_6_IDX)
+# ─── Vocab (from vocab.jl) ───────────────────────────────────────────────────
+# VOCAB_SIZE, START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX, SPEAKER_1_IDX..SPEAKER_6_IDX,
+# TS_TOKEN_IDX, TE_TOKEN_IDX, speaker_token_id, is_speaker_token are defined in vocab.jl.
+# Decoder logits size = VOCAB_SIZE (chars + <START> + PAD + <END> + [S1]..[S6] + [TS] + [TE]).
 
 # ─── Encoder ─────────────────────────────────────────────────────────────────
 

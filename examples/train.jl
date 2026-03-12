@@ -2,14 +2,11 @@
 # Train the spectrogram encoder–decoder. Run from repo root:
 #   julia --project=. examples/train.jl [options]
 # Use --help for full list and defaults.
-# Load CUDA/cuDNN before Flux so Flux uses the GPU backend.
+# With --gpu, CUDA/cuDNN are loaded (before Flux) for GPU backend.
 #
 # Benchmarking: julia -t 4 --project=. examples/train.jl --gpu --benchmark 50
-#   Reports timing breakdown (data / transfer / forward+backward / accum+update).
-#   Use -t N (N>1) so batch generation runs in parallel and keeps GPU fed.
+#   Use -t N (N>1) so batch generation runs in parallel.
 
-using CUDA
-using cuDNN
 using ArgParse
 using Logging
 using MorseDecoder
@@ -168,32 +165,11 @@ function run_decode_one(model, batch, device, max_len)
     @info "decode" truth=(isempty(truth_s) ? "(empty)" : truth_s) decode=(isempty(decode_s) ? "(empty)" : decode_s)
 end
 
-"""Turn token ids into string; stop at EOS/PAD/0. Speaker tokens shown as [1]..[6]; chars as-is."""
-function token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer})
-    buf = Char[]
-    for i in ids
-        (i == EOS_TOKEN_IDX || i == PAD_TOKEN_IDX || i == 0) && break
-        i == START_TOKEN_IDX && continue
-        if is_speaker_token(i)
-            append!(buf, ['[', Char('0' + (i - SPEAKER_1_IDX + 1)), ']'])
-        elseif 1 <= i <= NUM_CHARS
-            push!(buf, IDX_TO_CHAR[i])
-        end
-    end
-    String(buf)
-end
+"""Display token ids as label string (with [S1]..[S6], [TS], [TE])."""
+token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer}) = token_ids_to_label(ids)
 
-"""Like token_ids_to_string_with_speakers but strips speaker tokens (plain text only)."""
-function token_ids_to_string(ids::AbstractVector{<:Integer})
-    buf = Char[]
-    for i in ids
-        (i == EOS_TOKEN_IDX || i == PAD_TOKEN_IDX || i == 0) && break
-        i == START_TOKEN_IDX && continue
-        is_speaker_token(i) && continue
-        1 <= i <= NUM_CHARS && push!(buf, IDX_TO_CHAR[i])
-    end
-    String(buf)
-end
+"""Plain text only (no special tokens)."""
+token_ids_to_string(ids::AbstractVector{<:Integer}) = token_ids_to_plain_text(ids)
 
 function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0, self_attn_residual_scale::Float64=1.0)
     mkpath(dirname(path))
@@ -327,12 +303,17 @@ end
 
 function main()
     args = parse_commandline()
+    if args.gpu
+        # Load GPU stack so Flux.gpu works
+        using CUDA
+        using cuDNN
+    end
     rng = MersenneTwister(42)
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
-    # Data: 1–3 stations. Spectrogram is band-limited to 100–900 Hz (Morse is 200–800 Hz); we never feed full FFT, only n_bins in that range. Cap at 512 frames for GPU memory.
-    cfg = SamplerConfig(; n_stations_range=1:3, spec=SpectrogramConfig(; freq_lo=100f0, freq_hi=900f0, max_frames=512))
+    # Data via MorseSimulator: 200–900 Hz mel, ~10 Hz resolution, time resolution for 50 WPM. Cap 512 frames for GPU.
+    cfg = SamplerConfig(; max_frames=512)
     batch = generate_batch_fast(cfg, args.batch_size; rng)
     n_bins = size(batch.spectrogram, 1)
 
