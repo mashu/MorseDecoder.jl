@@ -96,11 +96,11 @@ function parse_commandline()
         "--decoder-layers"
         help = "Decoder self-attn layers (0 = cross-only decoder; each pairs with one cross-attn, interleaved)"
         arg_type = Int
-        default = 2
+        default = 4
         "--cross-layers"
-        help = "Cross-attention layers (0 = same as decoder-layers; >0 adds extra cross-only)"
+        help = "Cross-attention layers (0 = same as decoder-layers; 6 default = 4 paired + 2 cross-only)"
         arg_type = Int
-        default = 0
+        default = 6
         "--n-heads"
         help = "Number of attention heads"
         arg_type = Int
