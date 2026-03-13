@@ -240,14 +240,20 @@ end
     prepare_ctc_targets(batch::Batch) -> Vector{Vector{Int}}
 
 Extract CTC label sequences from a Batch. Strips START, PAD, EOS (decoder-only tokens);
-keeps characters, speaker tokens, [TS], [TE]. Each element is a variable-length Vector{Int}.
+keeps characters, speaker tokens, [TS], [TE]. Truncates each sequence so it fits CTC
+alignment: for sample b we need input_lengths[b] >= 2*L+1, so L_max = div(input_lengths[b]-1, 2).
+This avoids impossible alignments when the spectrogram was truncated to max_frames but
+the decoder target was not (which would otherwise give Inf loss / NaN gradients).
 """
 function prepare_ctc_targets(batch::Batch)
     B = size(batch.targets, 1)
     ctc_targets = Vector{Vector{Int}}(undef, B)
     for b in 1:B
         tgt = @view batch.targets[b, 1:batch.target_lengths[b]]
-        ctc_targets[b] = [t for t in tgt if t != START_TOKEN_IDX && t != PAD_TOKEN_IDX && t != EOS_TOKEN_IDX && t != 0]
+        raw = [t for t in tgt if t != START_TOKEN_IDX && t != PAD_TOKEN_IDX && t != EOS_TOKEN_IDX && t != 0]
+        T_b = batch.input_lengths[b]
+        L_max = max(0, div(T_b - 1, 2))  # CTC needs T >= 2*L+1
+        ctc_targets[b] = length(raw) <= L_max ? raw : raw[1:L_max]
     end
     ctc_targets
 end
