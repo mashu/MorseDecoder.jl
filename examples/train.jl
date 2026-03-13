@@ -186,10 +186,11 @@ token_ids_to_string(ids::AbstractVector{<:Integer}) = token_ids_to_plain_text(id
 function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0, self_attn_residual_scale::Float64=1.0, ctc_weight::Float64=0.0)
     mkpath(dirname(path))
     model_cpu = cpu(model)
-    opt_cpu = cpu(opt)
     model_state = Flux.state(model_cpu)
+    # Do not save optimiser_state: Muon (and some other optimisers) contain anonymous functions
+    # that JLD2 cannot serialize. On resume we create a fresh optimizer and apply the LR schedule.
     jldsave(path; step, n_bins, dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale,
-            ctc_weight, model_state, optimiser_state=opt_cpu)
+            ctc_weight, model_state)
     @info "checkpoint saved" step=step path=path
 end
 
@@ -301,7 +302,7 @@ function load_checkpoint(path::String)
             step = f["step"]
             n_bins = f["n_bins"]
             model_state = f["model_state"]
-            optimiser_state = f["optimiser_state"]
+            optimiser_state = get(f, "optimiser_state", nothing)  # optional; we reinit optimizer on resume
             dim = haskey(f, "dim") ? f["dim"] : nothing
             encoder_layers = haskey(f, "encoder_layers") ? f["encoder_layers"] : (haskey(f, "n_layers") ? f["n_layers"] : nothing)
             n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
@@ -349,7 +350,8 @@ function main()
             Flux.loadmodel!(model, d.model_state)
             step_start = d.step + 1
             n_bins = d.n_bins
-            opt = d.optimiser_state
+            # Fresh optimizer on resume (Muon state is not saved; adjust! applies LR schedule each step)
+            opt = Flux.setup(Muon(eta=Float32(args.lr)), model)
             if args.gpu
                 model = device(model)
                 opt = device(opt)
