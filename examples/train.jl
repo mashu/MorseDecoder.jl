@@ -76,7 +76,7 @@ function parse_commandline()
         "--lr"
         help = "Peak learning rate (with --warmup-fraction > 0, schedule goes startval -> lr -> endval)"
         arg_type = Float32
-        default = 3f-4
+        default = Float32(1.5f-4)
         "--warmup-fraction"
         help = "Fraction of steps for LR warmup (0 = constant LR). Capped at 1000 steps for small models. One-cycle then cosine decay to lr/100."
         arg_type = Float64
@@ -121,6 +121,10 @@ function parse_commandline()
         help = "Weight for CTC loss (0 = no CTC; joint CTC/attention training, default 0.4)"
         arg_type = Float64
         default = 0.4
+        "--label-smoothing"
+        help = "Label smoothing for decoder CE (0 = none; 0.1 default to reduce overconfident collapse)"
+        arg_type = Float64
+        default = 0.1
     end
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
@@ -138,7 +142,7 @@ function parse_commandline()
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
       benchmark = parsed["benchmark"],
-      ctc_weight)
+      ctc_weight, label_smoothing = parsed["label-smoothing"])
 end
 
 function build_model(n_bins::Int; dim=128, n_heads=4, encoder_layers=12, decoder_layers=2, cross_layers=2, decoder_input_dropout=0.1, self_attn_residual_scale=1.0)
@@ -400,7 +404,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -449,7 +453,7 @@ function main()
         end
 
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target; ctc_kws...) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target; ctc_kws..., label_smoothing=Float32(args.label_smoothing)) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 

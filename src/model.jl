@@ -216,19 +216,26 @@ end
 # ─── Loss (masked cross-entropy over sequence) ─────────────────────────────────
 
 """
-    sequence_cross_entropy(logits, decoder_target; pad_idx)
+    sequence_cross_entropy(logits, decoder_target; pad_idx, label_smoothing)
 
 Logits (vocab, seq, batch), decoder_target (seq, batch). Mean CE over non-pad positions.
+When label_smoothing > 0, targets are smoothed toward uniform to reduce overconfident collapse.
 """
 function sequence_cross_entropy(
     logits::AbstractArray{T,3},
     decoder_target::AbstractArray{<:Integer,2};
     pad_idx::Int = PAD_TOKEN_IDX,
+    label_smoothing::Real = 0.0,
 ) where T
     vocab, seq_len, batch = size(logits)
     log_probs = Flux.logsoftmax(logits; dims=1)
     nll_flat = -sum(Flux.onehotbatch(vec(decoder_target), 1:vocab) .* reshape(log_probs, vocab, :); dims=1)
     nll = reshape(nll_flat, seq_len, batch)
+    if label_smoothing > 0
+        ε = T(label_smoothing)
+        mean_log_prob = reshape(sum(log_probs; dims=1) / vocab, seq_len, batch)
+        nll = (1 - ε) .* nll .+ ε .* (-mean_log_prob)
+    end
     valid = decoder_target .!= pad_idx
     total_valid = max(sum(valid), 1)
     sum(nll .* valid) / total_valid
@@ -283,10 +290,11 @@ function train_step(
     ctc_targets = nothing,
     input_lengths = nothing,
     ctc_weight::Real = 0.0f0,
+    label_smoothing::Real = 0.0,
 )
     memory = model.encoder(spec)
     logits = model.decoder(decoder_input, memory)
-    loss = sequence_cross_entropy(logits, decoder_target)
+    loss = sequence_cross_entropy(logits, decoder_target; label_smoothing)
     if ctc_weight > 0 && ctc_targets !== nothing
         ctc_logits = model.ctc_head(memory)
         loss = loss + Float32(ctc_weight) * CTCLoss.ctc_loss_batched(ctc_logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
