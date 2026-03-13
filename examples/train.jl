@@ -108,22 +108,18 @@ function parse_commandline()
         help = "Dropout on decoder embeddings (e.g. 0.1) to encourage cross-attention use"
         arg_type = Float64
         default = 0.1
-        "--encoder-dropout"
-        help = "Fixed dropout on encoder output (same for whole training, default 0.1)"
-        arg_type = Float64
-        default = 0.1
         "--self-attn-residual-scale"
-        help = "Scale for decoder self-attention residual (1 = normal; <1 e.g. 0.5 = rely more on encoder)"
+        help = "Scale for decoder self-attention residual (1 = normal; 0.5 = rely more on encoder, default)"
         arg_type = Float64
-        default = 1.0
+        default = 0.5
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
         default = 0
         "--ctc-weight"
-        help = "Weight for CTC loss (0 = no CTC; joint CTC/attention training, default 0.2)"
+        help = "Weight for CTC loss (0 = no CTC; joint CTC/attention training, default 0.4)"
         arg_type = Float64
-        default = 0.2
+        default = 0.4
     end
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
@@ -140,7 +136,6 @@ function parse_commandline()
       dim = parsed["dim"], encoder_layers, decoder_layers, cross_layers, n_heads = parsed["n-heads"],
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
-      encoder_dropout = parsed["encoder-dropout"],
       benchmark = parsed["benchmark"],
       ctc_weight)
 end
@@ -223,8 +218,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = 0.0) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target) / args.accum_steps
         end
         if grads_accum === nothing
             grads_accum = result.grad[1]
@@ -259,8 +253,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
 
         t0 = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = 0.0) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
 
@@ -404,7 +397,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale encoder_dropout=args.encoder_dropout n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -453,8 +446,7 @@ function main()
         end
 
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target;
-                encoder_dropout = args.encoder_dropout, ctc_kws...) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target; ctc_kws...) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 

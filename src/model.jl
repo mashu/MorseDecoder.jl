@@ -269,7 +269,7 @@ function prepare_training_batch(batch::Batch)
 end
 
 """
-    train_step(model, spec, decoder_input, decoder_target; encoder_dropout, ctc_targets, input_lengths, ctc_weight)
+    train_step(model, spec, decoder_input, decoder_target; ctc_targets, input_lengths, ctc_weight)
 
 Single training step. 100% teacher forcing for decoder. When `ctc_weight > 0`,
 adds CTC loss on encoder output: `loss = CE + ctc_weight * CTC`.
@@ -280,15 +280,11 @@ function train_step(
     spec,
     decoder_input,
     decoder_target;
-    encoder_dropout::Real = 0.0,
     ctc_targets = nothing,
     input_lengths = nothing,
     ctc_weight::Real = 0.0f0,
 )
     memory = model.encoder(spec)
-    if encoder_dropout > 0 && rand(Float32) < encoder_dropout
-        memory = memory .* 0f0
-    end
     logits = model.decoder(decoder_input, memory)
     loss = sequence_cross_entropy(logits, decoder_target)
     if ctc_weight > 0 && ctc_targets !== nothing
