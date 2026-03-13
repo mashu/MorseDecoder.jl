@@ -24,6 +24,7 @@ using Random
 using JLD2
 using ChainRulesCore
 using UnicodePlots
+using CannotWaitForTheseOptimisers
 
 # Multi-step gradient accumulation: sum grads over N steps then one optimizer update.
 # Uses ChainRulesCore.add!! for in-place accumulation when possible (AD-agnostic).
@@ -360,14 +361,14 @@ function main()
             if args.gpu
                 model = device(model)
             end
-            opt = Flux.setup(Adam(args.lr), model)
+            opt = Flux.setup(Muon(eta=Float32(args.lr)), model)
         end
     else
         model = build_model(n_bins; dim=args.dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
         if args.gpu
             model = device(model)
         end
-        opt = Flux.setup(Adam(args.lr), model)
+        opt = Flux.setup(Muon(eta=Float32(args.lr)), model)
     end
 
     # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup capped for small models.
