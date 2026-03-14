@@ -356,20 +356,24 @@ function decode_autoregressive(
     batch_size::Int = size(spec, 2),
 )
     _, memory = encode(model, spec)  # decoder uses projected memory when encoder_dim != decoder_dim
-    ids_so_far = to_device(fill(start_token, 1, batch_size))
+    # Preallocate (max_len, batch) to avoid O(max_len) allocations from repeated cat
+    ids_buf = to_device(fill(start_token, max_len, batch_size))
+    len_so_far = 1
 
     for _ in 2:max_len
+        ids_so_far = view(ids_buf, 1:len_so_far, :)
         logits = model.decoder(ids_so_far, memory)
         next_logits = selectdim(logits, 2, size(logits, 2))
         next_logits[PAD_TOKEN_IDX, :] .= -1f10
         next_logits[START_TOKEN_IDX, :] .= -1f10
         am = argmax(next_logits; dims=1)
         next_ids = reshape((x -> x[1]).(am), 1, batch_size)
-        ids_so_far = cat(ids_so_far, next_ids; dims=1)
+        len_so_far += 1
+        ids_buf[len_so_far, :] .= vec(next_ids)
         all(==(EOS_TOKEN_IDX), next_ids) && break
     end
 
-    ids_so_far
+    view(ids_buf, 1:len_so_far, :)
 end
 
 # ─── CTC greedy decode ───────────────────────────────────────────────────────
