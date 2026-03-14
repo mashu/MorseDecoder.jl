@@ -78,9 +78,13 @@ function parse_commandline()
         arg_type = Float32
         default = Float32(1.5f-4)
         "--warmup-fraction"
-        help = "Fraction of steps for LR warmup (0 = constant LR). Capped at 1000 steps for small models. One-cycle then cosine decay to lr/100."
+        help = "Fraction of steps for LR warmup when --warmup-steps not set (0 = constant LR). One-cycle then cosine decay to lr/100."
         arg_type = Float64
         default = 0.01
+        "--warmup-steps"
+        help = "Fixed number of warmup steps (overrides warmup-fraction when > 0). Use e.g. 500 to avoid long percentage-based warmup."
+        arg_type = Int
+        default = 0
         "--decode-every"
         help = "Run decode on fixed val every N steps (0 = only at end)"
         arg_type = Int
@@ -97,6 +101,10 @@ function parse_commandline()
         help = "Number of encoder (self-attention) layers (min 5 for RoPE). Whisper-tiny uses 4."
         arg_type = Int
         default = 6
+        "--encoder-conv-kernels"
+        help = "Comma-separated kernel size per conv layer (default 3,5,7 for Morse multi-scale). Number of layers = length of list."
+        arg_type = String
+        default = "3,5,7"
         "--decoder-layers"
         help = "Decoder self-attn layers (0 = cross-only decoder; each pairs with one cross-attn, interleaved)"
         arg_type = Int
@@ -140,20 +148,24 @@ function parse_commandline()
     ctc_weight = parsed["ctc-weight"]
     encoder_dim_raw = parsed["encoder-dim"]
     encoder_dim = encoder_dim_raw <= 0 ? nothing : encoder_dim_raw  # 0 => use dim for both
+    conv_kernels_str = parsed["encoder-conv-kernels"]
+    encoder_conv_kernels = [parse(Int, strip(s)) for s in split(conv_kernels_str, ',')]
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
       accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
-      lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], decode_every = parsed["decode-every"],
-      dim = parsed["dim"], encoder_dim, encoder_layers, decoder_layers, cross_layers, n_heads = parsed["n-heads"],
+      lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], warmup_steps = parsed["warmup-steps"],
+      decode_every = parsed["decode-every"],
+      dim = parsed["dim"], encoder_dim, encoder_layers, encoder_conv_kernels,
+      decoder_layers, cross_layers, n_heads = parsed["n-heads"],
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
       benchmark = parsed["benchmark"],
       ctc_weight, label_smoothing = parsed["label-smoothing"])
 end
 
-function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0))
+function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, encoder_conv_kernels=[3, 5, 7], decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0))
     enc_dim = something(encoder_dim, dim)  # encoder_dim == dim (default) => single shared dim
-    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers)
+    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers; conv_kernel=encoder_conv_kernels)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
         n_cross_layers=cross_layers, decoder_input_dropout, self_attn_residual_scale)
     ctc_head = Dense(enc_dim => CTC_VOCAB_SIZE)
@@ -360,7 +372,7 @@ function main()
         cross_layers = something(get(d, :cross_layers, nothing), args.cross_layers)
         decoder_input_dropout = something(get(d, :decoder_input_dropout, nothing), args.decoder_input_dropout)
         self_attn_residual_scale = something(get(d, :self_attn_residual_scale, nothing), 1.0)
-        model = build_model(d.n_bins; dim, encoder_dim, n_heads, encoder_layers, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
+        model = build_model(d.n_bins; dim, encoder_dim, n_heads, encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
         try
             Flux.loadmodel!(model, d.model_state)
             step_start = d.step + 1
@@ -371,26 +383,26 @@ function main()
                 model = device(model)
                 opt = device(opt)
             end
-            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
+            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers encoder_conv_kernels=args.encoder_conv_kernels decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
         catch e
             @warn "Checkpoint incompatible (e.g. old architecture); starting fresh" path=checkpoint_path exception=(e isa Exception ? e : nothing)
-            model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
+            model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
             if args.gpu
                 model = device(model)
             end
             opt = Flux.setup(Muon(eta=args.lr), model)
         end
     else
-        model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
+        model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
         if args.gpu
             model = device(model)
         end
         opt = Flux.setup(Muon(eta=args.lr), model)
     end
 
-    # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup capped for small models.
-    lr_schedule = if args.warmup_fraction > 0
-        warmup_steps = min(ceil(Int, args.steps * args.warmup_fraction), 1000)
+    # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup: fixed --warmup-steps or fraction (capped).
+    warmup_steps = args.warmup_steps > 0 ? args.warmup_steps : (args.warmup_fraction > 0 ? min(ceil(Int, args.steps * args.warmup_fraction), 1000) : 0)
+    lr_schedule = if warmup_steps > 0
         percent_start = warmup_steps / args.steps
         startval = max(1f-8, args.lr / 25f0)
         endval = max(1f-9, args.lr / 100f0)
@@ -415,7 +427,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers encoder_conv_kernels=args.encoder_conv_kernels decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)

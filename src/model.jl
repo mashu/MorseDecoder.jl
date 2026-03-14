@@ -32,16 +32,16 @@ const CTC_BLANK_IDX  = CTC_VOCAB_SIZE
 """
     SpectrogramEncoder(n_freq_bins, dim, n_heads, n_layers; ...)
 
-Maps spectrogram to encoder hidden states. Conv1 → conv2 (kernel 3, pad 1) preserve time;
+Maps spectrogram to encoder hidden states. n_conv_layers conv layers (kernel conv_kernel, same-length pad) preserve time;
 no downsampling so the transformer sees full spectrogram resolution for Morse dit/dah timing.
+conv_kernel can be an Int (same for all layers) or a vector e.g. [3, 5, 7] for multi-scale (fine → dit → character). 50 WPM ~5 frames at 5.8 ms/frame per layer.
 
 - Input: (freq_bins, batch, time) spectrogram in **log10 scale** (same as training:
   MorseSimulator peak-norm + log10). For real audio use `spectrogram_to_model_scale` first.
 - Output: (dim, num_tokens, batch) where num_tokens = time.
 """
 struct SpectrogramEncoder
-    conv1
-    conv2
+    conv_layers
     blocks
     norm
     rope
@@ -58,21 +58,25 @@ function SpectrogramEncoder(
     ff_mult::Int = 4,
     norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 4096,
+    conv_kernel::AbstractVector{Int} = [3, 5, 7],
 )
-    conv1 = Conv((3,), n_freq_bins => dim, gelu; pad=1)
-    conv2 = Conv((3,), dim => dim, gelu; pad=1)
+    # Number of conv layers = length(conv_kernel). Default [3, 5, 7]: multi-scale for Morse (fine → dit → dit+gap).
+    kernels = conv_kernel
+    n_conv = length(kernels)
+    conv_layers = [Conv((kernels[i],), (i == 1 ? n_freq_bins : dim) => dim, gelu; pad = kernels[i] ÷ 2) for i in 1:n_conv]
     blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramEncoder(conv1, conv2, blocks, norm, rope)
+    SpectrogramEncoder(Tuple(conv_layers), blocks, norm, rope)
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
     # Mel from MorseSimulator is already log10(mel_energy), peak-normalized → values in (-10, 0].
     # Whisper uses log10 mel then (log_spec + 4) / 4; we use as-is so conv/attention see the same scale.
     x = permutedims(spec, (3, 1, 2))  # (time, freq_bins, batch)
-    x = enc.conv1(x)                   # (time, dim, batch)
-    x = enc.conv2(x)                   # (time, dim, batch)
+    for conv in enc.conv_layers
+        x = conv(x)
+    end
     h = permutedims(x, (2, 1, 3))     # (dim, time, batch)
     n_tokens = size(h, 2)
     rope = enc.rope[1:n_tokens]
