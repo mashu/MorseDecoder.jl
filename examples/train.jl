@@ -121,6 +121,10 @@ function parse_commandline()
         help = "Scale for decoder self-attention residual (1 = normal, Whisper-style; <1 = rely more on encoder)"
         arg_type = Float32
         default = Float32(1.0)
+        "--max-frames"
+        help = "Cap spectrogram time frames per sample (default 512). Fewer = less GPU memory and faster; need enough for longest transcript. Frontend already does 2× downsampling (~4 encoder frames/dot at 50 WPM)."
+        arg_type = Int
+        default = 512
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
@@ -147,6 +151,7 @@ function parse_commandline()
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
       accum_steps = parsed["accum"], checkpoint_dir = parsed["checkpoint-dir"],
       save_every = parsed["save-every"], prefetch = parsed["prefetch"],
+      max_frames = parsed["max-frames"],
       lr = parsed["lr"], warmup_fraction = parsed["warmup-fraction"], warmup_steps = parsed["warmup-steps"],
       decode_every = parsed["decode-every"],
       dim = parsed["dim"], encoder_dim, encoder_layers,
@@ -340,8 +345,8 @@ function main()
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
-    # Data via MorseSimulator: 200–900 Hz mel, ~10 Hz resolution, time resolution for 50 WPM. Cap 512 frames for GPU.
-    cfg = SamplerConfig(; max_frames=512)
+    # Data via MorseSimulator: 200–900 Hz mel, ~10 Hz resolution, time resolution for 50 WPM. max_frames caps time for GPU memory/speed.
+    cfg = SamplerConfig(; max_frames=args.max_frames)
     batch = generate_batch_fast(cfg, args.batch_size; rng)
     n_bins = size(batch.spectrogram, 1)
 
@@ -409,7 +414,7 @@ function main()
     val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -481,7 +486,12 @@ function main()
                 elapsed_total = time() - t0
                 steps_per_sec = (step - step_start + 1) / max(elapsed_total, 1e-9)
                 eta = Float64(lr_schedule(min(step, args.steps)))
-                @info "step" step=step loss=round(loss_avg; digits=4) lr=eta steps_per_sec=round(steps_per_sec; digits=2)
+                step_kw = (; step, loss=round(loss_avg; digits=4), lr=eta, steps_per_sec=round(steps_per_sec; digits=2))
+                if steps_per_sec < 1.0
+                    @info "step" step_kw... hint="Run with --benchmark 50 to see timing breakdown"
+                else
+                    @info "step" step_kw...
+                end
             end
             if step % args.save_every == 0
                 save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)

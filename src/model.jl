@@ -28,74 +28,33 @@ using Random
 const CTC_VOCAB_SIZE = VOCAB_SIZE + 1
 const CTC_BLANK_IDX  = CTC_VOCAB_SIZE
 
-# ─── CW front-end (ResBlock + CWFeatureExtractor) ───────────────────────────
+# ─── CW front-end (CWFeatureExtractor) ─────────────────────────────────────
 #
 # Full mel in; one stride-2 downsample → T/2 so transformer gets ~4 frames/dot at 50 WPM.
-# Only information reduction here: stride-2 (down1) halves time via learned conv (kernel 4),
-# so each output frame summarizes 4 input frames — intentional, not random drop.
+# Two convs: conv7 → gelu, conv4 stride-2 → gelu. No BatchNorm.
 #
-struct ResBlock
-    conv1::Conv
-    bn1::BatchNorm
-    conv2::Conv
-    bn2::BatchNorm
-end
-Flux.@layer ResBlock
-
-function ResBlock(ch::Int)
-    ResBlock(
-        Conv((3,), ch => ch; pad=1),
-        BatchNorm(ch),
-        Conv((3,), ch => ch; pad=1),
-        BatchNorm(ch),
-    )
-end
-
-function (b::ResBlock)(x)
-    h = b.conv1(x) |> b.bn1 |> relu
-    h = b.conv2(h) |> b.bn2
-    relu(h .+ x)
-end
-
 """
     CWFeatureExtractor(n_freq_bins; d_model=128)
 
-Conv front-end for CW Morse: full mel in, (T/2, d_model, B) out (one stride-2 for ~4 frames/dot at 50 WPM).
-- Input: (T, n_freq_bins, batch). Output: (T/2, d_model, batch).
+Minimal conv front-end: (T, n_freq_bins, B) → (T/2, d_model, B).
+Stack: conv7 → gelu, conv4 stride2 → gelu.
 """
 struct CWFeatureExtractor
-    lift::Conv
-    lift_bn::BatchNorm
-    res1::ResBlock
-    down1::Conv
-    down1_bn::BatchNorm
-    res2::ResBlock
-    to_dim::Conv  # stride 1, same time: 96 → d_model
-    to_dim_bn::BatchNorm
+    conv1::Conv
+    conv2::Conv
 end
 Flux.@layer CWFeatureExtractor
 
 function CWFeatureExtractor(n_freq_bins::Int; d_model::Int=128)
-    h1 = 64
-    h2 = 96
     CWFeatureExtractor(
-        Conv((7,), n_freq_bins => h1; pad=3),
-        BatchNorm(h1),
-        ResBlock(h1),
-        Conv((4,), h1 => h2; stride=2, pad=1),
-        BatchNorm(h2),
-        ResBlock(h2),
-        Conv((3,), h2 => d_model; pad=1),
-        BatchNorm(d_model),
+        Conv((7,), n_freq_bins => 64; pad=3),
+        Conv((4,), 64 => d_model; stride=2, pad=1),
     )
 end
 
 function (m::CWFeatureExtractor)(x)
-    h = m.lift(x) |> m.lift_bn |> relu
-    h = m.res1(h)
-    h = m.down1(h) |> m.down1_bn |> relu
-    h = m.res2(h)
-    h = m.to_dim(h) |> m.to_dim_bn |> relu
+    h = m.conv1(x) |> gelu   # (T, 64, B)
+    h = m.conv2(h) |> gelu   # (T/2, d_model, B)
     h
 end
 
@@ -109,8 +68,7 @@ const CW_FRONTEND_DIM = 128
 """
     SpectrogramEncoder(n_freq_bins, dim, n_heads, n_layers; ...)
 
-Maps spectrogram to encoder hidden states. **Frontend:** CWFeatureExtractor (full mel → ResBlocks →
-one stride-2 → T/2). **Then:** transformer blocks.
+Maps spectrogram to encoder hidden states. **Frontend:** CWFeatureExtractor (conv7 → gelu, conv4 stride-2 → gelu; one downsampling → T/2). **Then:** transformer blocks.
 
 **Time resolution:** Spectrogram ~344 Hz (hop 128 @ 44.1 kHz); after 2× downsampling the transformer
 sees ~172 Hz. At 50 WPM a dot ≈ 24 ms → ~4 frames per dot, dash ~12 frames. Gives the transformer
@@ -150,7 +108,7 @@ end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
     x = permutedims(spec, (3, 1, 2))   # (time, freq_bins, batch)
-    h = enc.frontend(x)                 # (T/2, 128, batch) — CW feature extractor with skip connections
+    h = enc.frontend(x)                 # (T/2, 128, batch)
     h = permutedims(h, (2, 1, 3))      # (128, T/2, batch)
     if enc.proj !== nothing
         T_enc, B = size(h, 2), size(h, 3)
