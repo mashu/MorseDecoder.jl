@@ -88,15 +88,15 @@ function parse_commandline()
         "--dim"
         help = "Model dimension (decoder; also encoder when --encoder-dim not set)"
         arg_type = Int
-        default = 128
+        default = 384
         "--encoder-dim"
         help = "Encoder dimension (default: same as dim). Larger encoder_dim gives CTC/encoder more capacity; use projection to decoder dim."
         arg_type = Int
         default = 0
         "--encoder-layers"
-        help = "Number of encoder (self-attention) layers (min 5 for RoPE)"
+        help = "Number of encoder (self-attention) layers (min 5 for RoPE). Whisper-tiny uses 4."
         arg_type = Int
-        default = 12
+        default = 6
         "--decoder-layers"
         help = "Decoder self-attn layers (0 = cross-only decoder; each pairs with one cross-attn, interleaved)"
         arg_type = Int
@@ -108,7 +108,7 @@ function parse_commandline()
         "--n-heads"
         help = "Number of attention heads"
         arg_type = Int
-        default = 4
+        default = 6
         "--decoder-input-dropout"
         help = "Dropout on decoder embeddings (e.g. 0.1) to encourage cross-attention use"
         arg_type = Float32
@@ -151,7 +151,7 @@ function parse_commandline()
       ctc_weight, label_smoothing = parsed["label-smoothing"])
 end
 
-function build_model(n_bins::Int; dim=128, encoder_dim=nothing, n_heads=4, encoder_layers=12, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(0.5))
+function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(0.5))
     enc_dim = something(encoder_dim, dim)  # encoder_dim == dim (default) => single shared dim
     encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
