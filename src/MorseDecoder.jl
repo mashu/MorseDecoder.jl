@@ -59,7 +59,7 @@ export
 
     # Model
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
-    encode,
+    encode, ENCODER_DOWNSAMPLE,
     prepare_decoder_batch, prepare_training_batch, train_step,
     decode_autoregressive, sequence_cross_entropy,
 

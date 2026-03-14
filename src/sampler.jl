@@ -35,12 +35,12 @@ struct SamplerConfig
 end
 
 # 200–900 Hz only (Morse CW). ~10 Hz freq resolution → fft_size ≥ sr/10 (44100/10=4410 → 4096).
-# 50 WPM: dit ≈ 24 ms; ≥2–3 frames per dit → hop ≤ 8–12 ms; hop 256 @ 44.1 kHz ≈ 5.8 ms.
+# 50 WPM: dit ≈ 24 ms; ≥4–5 frames per dit → hop ≤ ~5 ms; hop 128 @ 44.1 kHz ≈ 2.9 ms (~8 frames/dot).
 function SamplerConfig(;
     path = DirectPath(),
     sample_rate::Int = 44100,
     fft_size::Int = 4096,      # ~10.8 Hz bin at 44.1 kHz
-    hop_size::Int = 256,       # ~5.8 ms/frame, good for 50 WPM
+    hop_size::Int = 128,       # ~2.9 ms/frame, 4–5+ frames/dot up to ~80 WPM
     n_mels::Int = 40,
     f_min::Float64 = 200.0,
     f_max::Float64 = 900.0,
@@ -64,6 +64,7 @@ One training sample from MorseSimulator (spectrogram + label as token_ids).
 function generate_sample(cfg::SamplerConfig; rng::AbstractRNG = Random.default_rng())
     ds = sim_generate_sample(rng, cfg.dataset_config)
     spec = Float32.(ds.mel_spectrogram)
+    # Truncating spec loses the tail; target (ids) is left full — decoder/CTC see partial audio vs full label for long clips.
     if cfg.max_frames !== nothing && size(spec, 2) > cfg.max_frames
         spec = spec[:, 1:cfg.max_frames]
     end

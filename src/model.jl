@@ -27,21 +27,101 @@ using Random
 const CTC_VOCAB_SIZE = VOCAB_SIZE + 1
 const CTC_BLANK_IDX  = CTC_VOCAB_SIZE
 
-# ─── Encoder ─────────────────────────────────────────────────────────────────
+# ─── CW front-end (ResBlock + CWFeatureExtractor) ───────────────────────────
+#
+# Full mel in; one stride-2 downsample → T/2 so transformer gets ~4 frames/dot at 50 WPM.
+# Only information reduction here: stride-2 (down1) halves time via learned conv (kernel 4),
+# so each output frame summarizes 4 input frames — intentional, not random drop.
+#
+struct ResBlock
+    conv1::Conv
+    bn1::BatchNorm
+    conv2::Conv
+    bn2::BatchNorm
+end
+Flux.@layer ResBlock
+
+function ResBlock(ch::Int)
+    ResBlock(
+        Conv((3,), ch => ch; pad=1),
+        BatchNorm(ch),
+        Conv((3,), ch => ch; pad=1),
+        BatchNorm(ch),
+    )
+end
+
+function (b::ResBlock)(x)
+    h = b.conv1(x) |> b.bn1 |> relu
+    h = b.conv2(h) |> b.bn2
+    relu(h .+ x)
+end
+
+"""
+    CWFeatureExtractor(n_freq_bins; d_model=128)
+
+Conv front-end for CW Morse: full mel in, (T/2, d_model, B) out (one stride-2 for ~4 frames/dot at 50 WPM).
+- Input: (T, n_freq_bins, batch). Output: (T/2, d_model, batch).
+"""
+struct CWFeatureExtractor
+    lift::Conv
+    lift_bn::BatchNorm
+    res1::ResBlock
+    down1::Conv
+    down1_bn::BatchNorm
+    res2::ResBlock
+    to_dim::Conv  # stride 1, same time: 96 → d_model
+    to_dim_bn::BatchNorm
+end
+Flux.@layer CWFeatureExtractor
+
+function CWFeatureExtractor(n_freq_bins::Int; d_model::Int=128)
+    h1 = 64
+    h2 = 96
+    CWFeatureExtractor(
+        Conv((7,), n_freq_bins => h1; pad=3),
+        BatchNorm(h1),
+        ResBlock(h1),
+        Conv((4,), h1 => h2; stride=2, pad=1),
+        BatchNorm(h2),
+        ResBlock(h2),
+        Conv((3,), h2 => d_model; pad=1),
+        BatchNorm(d_model),
+    )
+end
+
+function (m::CWFeatureExtractor)(x)
+    h = m.lift(x) |> m.lift_bn |> relu
+    h = m.res1(h)
+    h = m.down1(h) |> m.down1_bn |> relu
+    h = m.res2(h)
+    h = m.to_dim(h) |> m.to_dim_bn |> relu
+    h
+end
+
+# ─── Encoder ───────────────────────────────────────────────────────────────
+
+"""Encoder time is spectrogram time ÷ this (CW front-end has one stride-2 → T/2)."""
+const ENCODER_DOWNSAMPLE = 2
+
+const CW_FRONTEND_DIM = 128
 
 """
     SpectrogramEncoder(n_freq_bins, dim, n_heads, n_layers; ...)
 
-Maps spectrogram to encoder hidden states. n_conv_layers conv layers (kernel conv_kernel, same-length pad) preserve time;
-no downsampling so the transformer sees full spectrogram resolution for Morse dit/dah timing.
-conv_kernel can be an Int (same for all layers) or a vector e.g. [3, 5, 7] for multi-scale (fine → dit → character). 50 WPM ~5 frames at 5.8 ms/frame per layer.
+Maps spectrogram to encoder hidden states. **Frontend:** CWFeatureExtractor (full mel → ResBlocks →
+one stride-2 → T/2). **Then:** transformer blocks.
+
+**Time resolution:** Spectrogram ~344 Hz (hop 128 @ 44.1 kHz); after 2× downsampling the transformer
+sees ~172 Hz. At 50 WPM a dot ≈ 24 ms → ~4 frames per dot, dash ~12 frames. Gives the transformer
+enough resolution to be robust to noise and distinguish dot vs dash.
 
 - Input: (freq_bins, batch, time) spectrogram in **log10 scale** (same as training:
   MorseSimulator peak-norm + log10). For real audio use `spectrogram_to_model_scale` first.
-- Output: (dim, num_tokens, batch) where num_tokens = time.
+- Output: (dim, num_tokens, batch) where num_tokens = time ÷ 2.
 """
 struct SpectrogramEncoder
-    conv_layers
+    frontend::CWFeatureExtractor
+    proj::Union{Dense,Nothing}  # 128 → dim when dim != 128
     blocks
     norm
     rope
@@ -58,26 +138,24 @@ function SpectrogramEncoder(
     ff_mult::Int = 4,
     norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 4096,
-    conv_kernel::AbstractVector{Int} = [3, 5, 7],
 )
-    # Number of conv layers = length(conv_kernel). Default [3, 5, 7]: multi-scale for Morse (fine → dit → dit+gap).
-    kernels = conv_kernel
-    n_conv = length(kernels)
-    conv_layers = [Conv((kernels[i],), (i == 1 ? n_freq_bins : dim) => dim, gelu; pad = kernels[i] ÷ 2) for i in 1:n_conv]
+    frontend = CWFeatureExtractor(n_freq_bins; d_model=CW_FRONTEND_DIM)
+    proj = dim == CW_FRONTEND_DIM ? nothing : Dense(CW_FRONTEND_DIM => dim)
     blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramEncoder(Tuple(conv_layers), blocks, norm, rope)
+    SpectrogramEncoder(frontend, proj, blocks, norm, rope)
 end
 
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
-    # Mel from MorseSimulator is already log10(mel_energy), peak-normalized → values in (-10, 0].
-    # Whisper uses log10 mel then (log_spec + 4) / 4; we use as-is so conv/attention see the same scale.
-    x = permutedims(spec, (3, 1, 2))  # (time, freq_bins, batch)
-    for conv in enc.conv_layers
-        x = conv(x)
+    x = permutedims(spec, (3, 1, 2))   # (time, freq_bins, batch)
+    h = enc.frontend(x)                 # (T/2, 128, batch) — CW feature extractor with skip connections
+    h = permutedims(h, (2, 1, 3))      # (128, T/2, batch)
+    if enc.proj !== nothing
+        T_enc, B = size(h, 2), size(h, 3)
+        h = enc.proj(reshape(h, size(h, 1), :))
+        h = reshape(h, size(h, 1), T_enc, B)  # (dim, T/2, batch)
     end
-    h = permutedims(x, (2, 1, 3))     # (dim, time, batch)
     n_tokens = size(h, 2)
     rope = enc.rope[1:n_tokens]
     for block in enc.blocks
@@ -197,7 +275,6 @@ end
 
 Flux.@layer SpectrogramEncoderDecoder
 
-# Convenience: (encoder, decoder, ctc_head) with encoder_proj=nothing; (encoder, decoder) builds ctc_head from decoder dim.
 SpectrogramEncoderDecoder(encoder::SpectrogramEncoder, decoder::SpectrogramDecoder, ctc_head::Dense) =
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head, nothing)
 function SpectrogramEncoderDecoder(encoder::SpectrogramEncoder, decoder::SpectrogramDecoder)
@@ -282,19 +359,23 @@ end
 """
     prepare_ctc_targets(batch::Batch) -> Vector{Vector{Int}}
 
-Extract CTC label sequences from a Batch. Strips START, PAD, EOS (decoder-only tokens);
-keeps characters, speaker tokens, [TS], [TE]. Truncates each sequence so it fits CTC
-alignment: for sample b we need input_lengths[b] >= 2*L+1, so L_max = div(input_lengths[b]-1, 2).
-This avoids impossible alignments when the spectrogram was truncated to max_frames but
-the decoder target was not (which would otherwise give Inf loss / NaN gradients).
+Extract CTC label sequences from a Batch: **one target sequence per sample** (from that sample's
+transcript in batch.targets). Strips START, PAD, EOS; keeps chars, speaker tokens, [TS], [TE].
+Truncates so encoder length (spectrogram ÷ ENCODER_DOWNSAMPLE) >= 2*L+1 for CTC.
+Targets vary per sample and per batch (each batch has different random transcripts from MorseSimulator).
 """
 function prepare_ctc_targets(batch::Batch)
+    enc_lengths = div.(batch.input_lengths, ENCODER_DOWNSAMPLE)
+    _prepare_ctc_targets_inner(batch, enc_lengths)
+end
+
+function _prepare_ctc_targets_inner(batch::Batch, enc_lengths::Vector{Int})
     B = size(batch.targets, 1)
     ctc_targets = Vector{Vector{Int}}(undef, B)
     for b in 1:B
         tgt = @view batch.targets[b, 1:batch.target_lengths[b]]
         raw = [t for t in tgt if t != START_TOKEN_IDX && t != PAD_TOKEN_IDX && t != EOS_TOKEN_IDX && t != 0]
-        T_b = batch.input_lengths[b]
+        T_b = enc_lengths[b]
         L_max = max(0, div(T_b - 1, 2))  # CTC needs T >= 2*L+1
         ctc_targets[b] = length(raw) <= L_max ? raw : raw[1:L_max]
     end
@@ -314,6 +395,7 @@ end
 """Dispatch: no CTC targets → return loss unchanged."""
 add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight) = loss
 function add_ctc_loss(loss, model::SpectrogramEncoderDecoder, enc_mem, ctc_targets::Vector{Vector{Int}}, input_lengths::Vector{Int}, ctc_weight::Real)
+    # input_lengths = encoder frame lengths: div.(batch.input_lengths, ENCODER_DOWNSAMPLE)
     loss + ctc_weight * CTCLoss.ctc_loss_batched(model.ctc_head(enc_mem), ctc_targets, input_lengths, CTC_BLANK_IDX)
 end
 
@@ -395,7 +477,8 @@ function ctc_greedy_decode(
 )
     enc_mem, _ = encode(model, spec)  # CTC uses raw encoder output
     ctc_logits = model.ctc_head(enc_mem)  # (CTC_VOCAB_SIZE, time, batch); keep on same device as enc_mem
-    CTCLoss.ctc_greedy_decode(ctc_logits, input_lengths; blank = CTC_BLANK_IDX)
+    enc_lengths = div.(input_lengths, ENCODER_DOWNSAMPLE)
+    CTCLoss.ctc_greedy_decode(ctc_logits, enc_lengths; blank = CTC_BLANK_IDX)
 end
 
 """
