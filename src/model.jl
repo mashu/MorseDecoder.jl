@@ -7,6 +7,9 @@
 - Encoder: full self-attention over time. Decoder: causal self-attention + cross-attention to encoder.
 - Optional CTC head on encoder output for streaming / joint CTC-attention training.
 - Loss: masked CE over sequence (PAD masked) + optional CTC loss. Caller moves data to GPU.
+- Balance: use a modest CTC weight (e.g. 0.15–0.2) so attention stays dominant; CTC mainly helps
+  alignment and streaming. If CTC underperforms, try a larger encoder (--encoder-dim > dim or
+  more --encoder-layers) so the encoder has enough capacity for frame-level predictions.
 """
 
 using Flux
@@ -53,7 +56,7 @@ function SpectrogramEncoder(
     n_layers::Int;
     n_kv_heads::Int = n_heads,
     ff_mult::Int = 4,
-    norm_eps::Float32 = 1f-5,
+    norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 4096,
 )
     conv1 = Conv((3,), n_freq_bins => dim, gelu; pad=1)
@@ -111,7 +114,7 @@ struct SpectrogramDecoder
     norm
     head
     rope
-    self_attn_residual_scale::Float32
+    self_attn_residual_scale::AbstractFloat
 end
 
 Flux.@layer SpectrogramDecoder
@@ -122,23 +125,23 @@ function SpectrogramDecoder(
     n_heads::Int,
     n_decoder_layers::Int;
     n_cross_layers::Int = n_decoder_layers,
-    decoder_input_dropout::Real = 0.0f0,
-    self_attn_residual_scale::Real = 1.0f0,
+    decoder_input_dropout::AbstractFloat = 0.0f0,
+    self_attn_residual_scale::AbstractFloat = 1.0f0,
     n_kv_heads::Int = n_heads,
     ff_mult::Int = 4,
-    norm_eps::Float32 = 1f-5,
+    norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 2048,
 )
     n_cross_layers >= n_decoder_layers || throw(ArgumentError("n_cross_layers ($n_cross_layers) must be >= n_decoder_layers ($n_decoder_layers)"))
     (n_decoder_layers > 0 || n_cross_layers >= 1) || throw(ArgumentError("when n_decoder_layers=0, n_cross_layers must be >= 1"))
     embed = Flux.Embedding(vocab_size => dim)
-    embed_dropout = Flux.Dropout(Float32(decoder_input_dropout))
+    embed_dropout = Flux.Dropout(decoder_input_dropout)
     self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_decoder_layers]
     cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps) for _ in 1:n_cross_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope, Float32(self_attn_residual_scale))
+    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope, self_attn_residual_scale)
 end
 
 function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}) where T
@@ -168,23 +171,49 @@ end
 # ─── Full model ───────────────────────────────────────────────────────────────
 
 """
-    SpectrogramEncoderDecoder(encoder, decoder, ctc_head)
+    SpectrogramEncoderDecoder(encoder, decoder, ctc_head; encoder_proj=nothing)
 
 Full model: encoder maps spectrogram to memory; decoder maps (decoder_input_ids, memory) to logits.
 `ctc_head` (Dense) projects encoder output to CTC vocabulary (VOCAB_SIZE + blank) for
 joint CTC/attention training and streaming inference.
+
+When encoder and decoder use different dimensions, `encoder_proj` is a Dense(encoder_dim => decoder_dim)
+so the decoder receives projected memory; CTC head always sees raw encoder output (richer representation
+for frame-level CTC). When dimensions match, `encoder_proj` is nothing.
 """
 struct SpectrogramEncoderDecoder
     encoder::SpectrogramEncoder
     decoder::SpectrogramDecoder
     ctc_head::Dense   # encoder output → CTC logits (CTC_VOCAB_SIZE)
+    encoder_proj::Union{Dense,Nothing}  # encoder_dim => decoder_dim when encoder_dim != decoder_dim
 end
 
 Flux.@layer SpectrogramEncoderDecoder
 
-function (m::SpectrogramEncoderDecoder)(spec, decoder_input_ids, memory=nothing)
-    enc_mem = something(memory, m.encoder(spec))
-    logits = m.decoder(decoder_input_ids, enc_mem)  # single stream: (vocab, seq, batch)
+# Convenience: (encoder, decoder, ctc_head) with encoder_proj=nothing; (encoder, decoder) builds ctc_head from decoder dim.
+SpectrogramEncoderDecoder(encoder::SpectrogramEncoder, decoder::SpectrogramDecoder, ctc_head::Dense) =
+    SpectrogramEncoderDecoder(encoder, decoder, ctc_head, nothing)
+function SpectrogramEncoderDecoder(encoder::SpectrogramEncoder, decoder::SpectrogramDecoder)
+    dim = size(decoder.embed.weight, 2)  # decoder hidden dim
+    SpectrogramEncoderDecoder(encoder, decoder, Dense(dim => CTC_VOCAB_SIZE), nothing)
+end
+
+"""Dispatch: no projection (same dim) vs Dense projection."""
+project_memory(::Nothing, x) = x
+project_memory(p::Dense, x) = p(x)
+
+"""Return (enc_mem, dec_mem): raw encoder output (for CTC) and memory for decoder (projected via encoder_proj)."""
+function encode(m::SpectrogramEncoderDecoder, spec)
+    enc_mem = m.encoder(spec)
+    (enc_mem, project_memory(m.encoder_proj, enc_mem))
+end
+
+function (m::SpectrogramEncoderDecoder)(spec, decoder_input_ids)
+    logits = m.decoder(decoder_input_ids, last(encode(m, spec)))
+    return logits
+end
+function (m::SpectrogramEncoderDecoder)(spec, decoder_input_ids, memory)
+    logits = m.decoder(decoder_input_ids, memory)
     return logits
 end
 
@@ -225,14 +254,14 @@ function sequence_cross_entropy(
     logits::AbstractArray{T,3},
     decoder_target::AbstractArray{<:Integer,2};
     pad_idx::Int = PAD_TOKEN_IDX,
-    label_smoothing::Real = 0.0,
+    label_smoothing::T = zero(T),
 ) where T
     vocab, seq_len, batch = size(logits)
     log_probs = Flux.logsoftmax(logits; dims=1)
     nll_flat = -sum(Flux.onehotbatch(vec(decoder_target), 1:vocab) .* reshape(log_probs, vocab, :); dims=1)
     nll = reshape(nll_flat, seq_len, batch)
     if label_smoothing > 0
-        ε = T(label_smoothing)
+        ε = label_smoothing
         mean_log_prob = reshape(sum(log_probs; dims=1) / vocab, seq_len, batch)
         nll = (1 - ε) .* nll .+ ε .* (-mean_log_prob)
     end
@@ -275,11 +304,17 @@ function prepare_training_batch(batch::Batch)
     (batch.spectrogram, dec.decoder_input, dec.decoder_target)
 end
 
+"""Dispatch: no CTC targets → return loss unchanged."""
+add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight) = loss
+function add_ctc_loss(loss, model::SpectrogramEncoderDecoder, enc_mem, ctc_targets::Vector{Vector{Int}}, input_lengths::Vector{Int}, ctc_weight::Real)
+    loss + ctc_weight * CTCLoss.ctc_loss_batched(model.ctc_head(enc_mem), ctc_targets, input_lengths, CTC_BLANK_IDX)
+end
+
 """
     train_step(model, spec, decoder_input, decoder_target; ctc_targets, input_lengths, ctc_weight)
 
-Single training step. 100% teacher forcing for decoder. When `ctc_weight > 0`,
-adds CTC loss on encoder output: `loss = CE + ctc_weight * CTC`.
+Single training step. 100% teacher forcing for decoder. When `ctc_targets` is provided,
+adds CTC loss: `loss = CE + ctc_weight * CTC`. Pass `ctc_targets=nothing` to skip CTC.
 `ctc_targets` is Vector{Vector{Int}} (CPU), `input_lengths` is Vector{Int} (CPU).
 """
 function train_step(
@@ -289,17 +324,13 @@ function train_step(
     decoder_target;
     ctc_targets = nothing,
     input_lengths = nothing,
-    ctc_weight::Real = 0.0f0,
-    label_smoothing::Real = 0.0,
+    ctc_weight::AbstractFloat = 0.0f0,
+    label_smoothing::AbstractFloat = 0.0f0,
 )
-    memory = model.encoder(spec)
-    logits = model.decoder(decoder_input, memory)
+    enc_mem, dec_mem = encode(model, spec)
+    logits = model.decoder(decoder_input, dec_mem)
     loss = sequence_cross_entropy(logits, decoder_target; label_smoothing)
-    if ctc_weight > 0 && ctc_targets !== nothing
-        ctc_logits = model.ctc_head(memory)
-        loss = loss + Float32(ctc_weight) * CTCLoss.ctc_loss_batched(ctc_logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
-    end
-    loss
+    add_ctc_loss(loss, model, enc_mem, ctc_targets, input_lengths, ctc_weight)
 end
 
 train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
@@ -321,21 +352,18 @@ function decode_autoregressive(
     to_device = identity,
     batch_size::Int = size(spec, 2),
 )
-    memory = model.encoder(spec)
+    _, memory = encode(model, spec)  # decoder uses projected memory when encoder_dim != decoder_dim
     ids_so_far = to_device(fill(start_token, 1, batch_size))
 
     for _ in 2:max_len
         logits = model.decoder(ids_so_far, memory)
         next_logits = selectdim(logits, 2, size(logits, 2))
-        next_logits_cpu = Array(next_logits)
-        next_logits_cpu[PAD_TOKEN_IDX, :] .= -1f10
-        next_logits_cpu[START_TOKEN_IDX, :] .= -1f10
-        am = argmax(next_logits_cpu; dims=1)
-        next_ids_cpu = reshape(map(i -> i[1], am), 1, batch_size)
-        next_ids = to_device(next_ids_cpu)
+        next_logits[PAD_TOKEN_IDX, :] .= -1f10
+        next_logits[START_TOKEN_IDX, :] .= -1f10
+        am = argmax(next_logits; dims=1)
+        next_ids = reshape((x -> x[1]).(am), 1, batch_size)
         ids_so_far = cat(ids_so_far, next_ids; dims=1)
-        # Stop when all batch positions have emitted EOS
-        all(i -> i == EOS_TOKEN_IDX, next_ids_cpu) && break
+        all(==(EOS_TOKEN_IDX), next_ids) && break
     end
 
     ids_so_far
@@ -354,8 +382,8 @@ function ctc_greedy_decode(
     spec;
     input_lengths::Vector{Int} = fill(size(spec, 3), size(spec, 2)),
 )
-    memory = model.encoder(spec)
-    ctc_logits = Array(model.ctc_head(memory))  # (CTC_VOCAB_SIZE, time, batch)
+    enc_mem, _ = encode(model, spec)  # CTC uses raw encoder output
+    ctc_logits = model.ctc_head(enc_mem)  # (CTC_VOCAB_SIZE, time, batch); keep on same device as enc_mem
     CTCLoss.ctc_greedy_decode(ctc_logits, input_lengths; blank = CTC_BLANK_IDX)
 end
 
