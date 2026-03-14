@@ -206,7 +206,7 @@ token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer}) = token_ids_to
 """Plain text only (no special tokens)."""
 token_ids_to_string(ids::AbstractVector{<:Integer}) = token_ids_to_plain_text(ids)
 
-function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_dim=nothing, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float64=0.0, self_attn_residual_scale::Float64=1.0, ctc_weight::Float64=0.0)
+function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_dim=nothing, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float32=0.0f0, self_attn_residual_scale::Float32=1.0f0, ctc_weight::Float32=0.0f0)
     mkpath(dirname(path))
     model_cpu = cpu(model)  # checkpoint serialization: save CPU state (no device in file)
     model_state = Flux.state(model_cpu)
@@ -319,28 +319,24 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     end
 end
 
+"""Load checkpoint; returns nothing if path does not exist. Errors propagate if file exists but is corrupt (no try-catch to avoid CUDA memory leaks)."""
 function load_checkpoint(path::String)
     isfile(path) || return nothing
-    try
-        jldopen(path, "r") do f
-            step = f["step"]
-            n_bins = f["n_bins"]
-            model_state = f["model_state"]
-            optimiser_state = get(f, "optimiser_state", nothing)  # optional; we reinit optimizer on resume
-            dim = haskey(f, "dim") ? f["dim"] : nothing
-            encoder_dim = haskey(f, "encoder_dim") ? f["encoder_dim"] : nothing
-            encoder_layers = haskey(f, "encoder_layers") ? f["encoder_layers"] : (haskey(f, "n_layers") ? f["n_layers"] : nothing)
-            n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
-            decoder_layers = haskey(f, "decoder_layers") ? f["decoder_layers"] : nothing
-            cross_layers = haskey(f, "cross_layers") ? f["cross_layers"] : (haskey(f, "n_cross_layers") ? f["n_cross_layers"] : nothing)
-            decoder_input_dropout = haskey(f, "decoder_input_dropout") ? f["decoder_input_dropout"] : nothing
-            self_attn_residual_scale = haskey(f, "self_attn_residual_scale") ? f["self_attn_residual_scale"] : nothing
-            ctc_weight = haskey(f, "ctc_weight") ? f["ctc_weight"] : 0.0
-            (; step, n_bins, model_state, optimiser_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, ctc_weight)
-        end
-    catch e
-        @warn "Checkpoint unreadable or corrupt, starting fresh" path=path exception=e
-        return nothing
+    jldopen(path, "r") do f
+        step = f["step"]
+        n_bins = f["n_bins"]
+        model_state = f["model_state"]
+        optimiser_state = get(f, "optimiser_state", nothing)  # optional; we reinit optimizer on resume
+        dim = haskey(f, "dim") ? f["dim"] : nothing
+        encoder_dim = haskey(f, "encoder_dim") ? f["encoder_dim"] : nothing
+        encoder_layers = haskey(f, "encoder_layers") ? f["encoder_layers"] : (haskey(f, "n_layers") ? f["n_layers"] : nothing)
+        n_heads = haskey(f, "n_heads") ? f["n_heads"] : nothing
+        decoder_layers = haskey(f, "decoder_layers") ? f["decoder_layers"] : nothing
+        cross_layers = haskey(f, "cross_layers") ? f["cross_layers"] : (haskey(f, "n_cross_layers") ? f["n_cross_layers"] : nothing)
+        decoder_input_dropout = haskey(f, "decoder_input_dropout") ? Float32(f["decoder_input_dropout"]) : nothing
+        self_attn_residual_scale = haskey(f, "self_attn_residual_scale") ? Float32(f["self_attn_residual_scale"]) : nothing
+        ctc_weight = Float32(haskey(f, "ctc_weight") ? f["ctc_weight"] : 0.0)
+        (; step, n_bins, model_state, optimiser_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, ctc_weight)
     end
 end
 
@@ -370,28 +366,20 @@ function main()
         n_heads = something(get(d, :n_heads, nothing), args.n_heads)
         decoder_layers = something(get(d, :decoder_layers, nothing), args.decoder_layers)
         cross_layers = something(get(d, :cross_layers, nothing), args.cross_layers)
-        decoder_input_dropout = something(get(d, :decoder_input_dropout, nothing), args.decoder_input_dropout)
-        self_attn_residual_scale = something(get(d, :self_attn_residual_scale, nothing), 1.0)
+        decoder_input_dropout = Float32(something(get(d, :decoder_input_dropout, nothing), args.decoder_input_dropout))
+        self_attn_residual_scale = Float32(something(get(d, :self_attn_residual_scale, nothing), 1.0f0))
         model = build_model(d.n_bins; dim, encoder_dim, n_heads, encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
-        try
-            Flux.loadmodel!(model, d.model_state)
-            step_start = d.step + 1
-            n_bins = d.n_bins
-            # Fresh optimizer on resume (Muon state is not saved; adjust! applies LR schedule each step)
-            opt = Flux.setup(Muon(eta=args.lr), model)
-            if args.gpu
-                model = device(model)
-                opt = device(opt)
-            end
-            @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers encoder_conv_kernels=args.encoder_conv_kernels decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
-        catch e
-            @warn "Checkpoint incompatible (e.g. old architecture); starting fresh" path=checkpoint_path exception=(e isa Exception ? e : nothing)
-            model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
-            if args.gpu
-                model = device(model)
-            end
-            opt = Flux.setup(Muon(eta=args.lr), model)
+        # No try-catch: errors propagate (avoids CUDA memory leaks). Incompatible checkpoint => fix or remove file and rerun.
+        Flux.loadmodel!(model, d.model_state)
+        step_start = d.step + 1
+        n_bins = d.n_bins
+        # Fresh optimizer on resume (Muon state is not saved; adjust! applies LR schedule each step)
+        opt = Flux.setup(Muon(eta=args.lr), model)
+        if args.gpu
+            model = device(model)
+            opt = device(opt)
         end
+        @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers encoder_conv_kernels=args.encoder_conv_kernels decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
     else
         model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, encoder_conv_kernels=args.encoder_conv_kernels, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
         if args.gpu
