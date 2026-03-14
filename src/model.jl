@@ -13,6 +13,7 @@
 """
 
 using Flux
+using KernelAbstractions: KernelAbstractions as KA, get_backend, synchronize, @kernel, @index, @uniform
 using Onion
 using Onion: TransformerBlock, RoPE, RMSNorm
 using Einops: rearrange, @einops_str
@@ -452,14 +453,46 @@ function decode_autoregressive(
         next_logits = selectdim(logits, 2, size(logits, 2))
         next_logits[PAD_TOKEN_IDX, :] .= -1f10
         next_logits[START_TOKEN_IDX, :] .= -1f10
-        am = argmax(next_logits; dims=1)
-        next_ids = reshape((x -> x[1]).(am), 1, batch_size)
+        next_ids = argmax_dim1(next_logits)
         len_so_far += 1
         ids_buf[len_so_far, :] .= vec(next_ids)
         all(==(EOS_TOKEN_IDX), next_ids) && break
     end
 
     ids_buf[1:len_so_far, :]  # return slice (caller typically cpu() next, so view vs copy irrelevant)
+end
+
+# Argmax along dim 1 (vocab) via KernelAbstractions; avoids CuArray's tuple reduction (isless/convert) that fails on some GPUs.
+@kernel function argmax_dim1_kernel(logits, out)
+    b = @index(Global)
+    @uniform vocab_size = size(logits, 1)
+    n_batch = size(logits, 2)
+    if b <= n_batch
+        best_i = 1
+        best_v = @inbounds logits[1, b]
+        for i in 2:vocab_size
+            v = @inbounds logits[i, b]
+            if v > best_v
+                best_v = v
+                best_i = i
+            end
+        end
+        @inbounds out[b] = best_i
+    end
+end
+
+function argmax_dim1(logits)
+    backend = get_backend(logits)
+    if backend isa KA.GPU
+        batch_size = size(logits, 2)
+        out = similar(logits, Int32, (batch_size,))
+        argmax_dim1_kernel(backend, 256)(logits, out; ndrange=batch_size)
+        synchronize(backend)
+        reshape(Int.(out), 1, batch_size)
+    else
+        am = argmax(logits; dims=1)
+        reshape((x -> x[1]).(am), 1, size(logits, 2))
+    end
 end
 
 # ─── CTC greedy decode ───────────────────────────────────────────────────────
