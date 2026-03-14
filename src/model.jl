@@ -447,7 +447,7 @@ function decode_autoregressive(
     len_so_far = 1
 
     for _ in 2:max_len
-        ids_so_far = view(ids_buf, 1:len_so_far, :)
+        ids_so_far = copy(ids_buf[1:len_so_far, :])  # contiguous; decoder Embedding on GPU needs plain array, not view
         logits = model.decoder(ids_so_far, memory)
         next_logits = selectdim(logits, 2, size(logits, 2))
         next_logits[PAD_TOKEN_IDX, :] .= -1f10
@@ -459,7 +459,7 @@ function decode_autoregressive(
         all(==(EOS_TOKEN_IDX), next_ids) && break
     end
 
-    view(ids_buf, 1:len_so_far, :)
+    ids_buf[1:len_so_far, :]  # return slice (caller typically cpu() next, so view vs copy irrelevant)
 end
 
 # ─── CTC greedy decode ───────────────────────────────────────────────────────
