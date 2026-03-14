@@ -114,17 +114,17 @@ function parse_commandline()
         arg_type = Float32
         default = Float32(0.1)
         "--self-attn-residual-scale"
-        help = "Scale for decoder self-attention residual (1 = normal; 0.5 = rely more on encoder, default)"
+        help = "Scale for decoder self-attention residual (1 = normal, Whisper-style; <1 = rely more on encoder)"
         arg_type = Float32
-        default = Float32(0.5)
+        default = Float32(1.0)
         "--benchmark"
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
         default = 0
         "--ctc-weight"
-        help = "Weight for CTC loss (0 = no CTC). Lower (e.g. 0.15–0.2) keeps attention dominant; default 0.2"
+        help = "Weight for CTC loss (0 = no CTC). Light nudge (e.g. 0.05–0.1) keeps attention dominant; default 0.1"
         arg_type = Float32
-        default = Float32(0.2)
+        default = Float32(0.1)
         "--label-smoothing"
         help = "Label smoothing for decoder CE (0 = none; 0.1 default to reduce overconfident collapse)"
         arg_type = Float32
@@ -151,7 +151,7 @@ function parse_commandline()
       ctc_weight, label_smoothing = parsed["label-smoothing"])
 end
 
-function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(0.5))
+function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0))
     enc_dim = something(encoder_dim, dim)  # encoder_dim == dim (default) => single shared dim
     encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;

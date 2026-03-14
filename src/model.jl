@@ -173,13 +173,16 @@ end
 """
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head; encoder_proj=nothing)
 
-Full model: encoder maps spectrogram to memory; decoder maps (decoder_input_ids, memory) to logits.
-`ctc_head` (Dense) projects encoder output to CTC vocabulary (VOCAB_SIZE + blank) for
-joint CTC/attention training and streaming inference.
+Full model: encoder → two sibling heads (CTC and decoder), not in sequence.
 
-When encoder and decoder use different dimensions, `encoder_proj` is a Dense(encoder_dim => decoder_dim)
-so the decoder receives projected memory; CTC head always sees raw encoder output (richer representation
-for frame-level CTC). When dimensions match, `encoder_proj` is nothing.
+  spec → Encoder → enc_mem
+            ├→ ctc_head(enc_mem)     → CTC logits (per frame; blank, collapse repeats)
+            └→ [encoder_proj] → dec_mem → Decoder(ids, dec_mem) → decoder logits (per step; START/EOS)
+
+CTC and decoder both consume the same encoder output; they are trained jointly (CE + CTC loss)
+but produce different hypotheses (frame-level vs autoregressive), so their outputs need not match.
+When encoder_dim != decoder dim, `encoder_proj` maps enc_mem → dec_mem for the decoder;
+CTC head always uses raw enc_mem.
 """
 struct SpectrogramEncoderDecoder
     encoder::SpectrogramEncoder
