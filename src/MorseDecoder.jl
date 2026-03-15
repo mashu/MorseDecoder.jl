@@ -16,6 +16,13 @@ cfg = SamplerConfig()   # 200–900 Hz, ~10 Hz resolution, max_frames=512
 s   = generate_sample(cfg; rng)
 batch = generate_batch_fast(cfg, 32; rng)
 ```
+
+# Chunked training and decoding
+
+- **ChunkedConversation(spec, token_ids, max_frames)** — iterable over `Sample` chunks of one conversation (split at [TS]/[TE]).
+- **ChunkedSampleSource(cfg, max_frames; rng)** — infinite iterator of chunked samples.
+- **ChunkedBatchSource(cfg, batch_size, max_frames; rng)** — infinite iterator of `Batch` for training.
+- **decode_conversation(model, chunks, to_device; ...)** — decode a full conversation from an iterable of spectrogram chunks (chunk-by-chunk with continuation; supports streaming).
 """
 module MorseDecoder
 
@@ -53,6 +60,8 @@ export
     # Sampler (MorseSimulator)
     Sample, SamplerConfig, generate_sample,
     Batch, collate, generate_batch, generate_batch_fast,
+    transmission_segments, segments_to_chunks, chunked_samples, generate_chunked_batch,
+    ChunkedConversation, ChunkedSampleSource, ChunkedBatchSource,
 
     # Visualization
     plot_spectrogram, plot_chunk,
@@ -61,7 +70,7 @@ export
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
     encode, ENCODER_DOWNSAMPLE,
     prepare_decoder_batch, prepare_training_batch, train_step,
-    decode_autoregressive, sequence_cross_entropy,
+    decode_autoregressive, decode_conversation, sequence_cross_entropy,
 
     # CTC (uses CTCLoss.jl; blank = CTC_BLANK_IDX)
     CTC_VOCAB_SIZE, CTC_BLANK_IDX,

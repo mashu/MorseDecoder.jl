@@ -177,8 +177,13 @@ function run_decode_test(model, batch, device; max_len::Int=128)
     run_decode_one(model, batch, device, max_len)
 end
 
-"""Run decode on each of several batches."""
+"""Run decode on each of several batches; show ground truth for one random chunk."""
 function run_decode_test(model, batches::AbstractVector, device; max_len::Int=128)
+    idx = rand(1:length(batches))
+    b = batches[idx]
+    truth_ids = b.targets[1, 1:b.target_lengths[1]]
+    truth_s = token_ids_to_string_with_speakers(truth_ids)
+    @info "ground_truth (random chunk)" chunk_index=idx truth=(isempty(truth_s) ? "(empty)" : truth_s)
     for (i, batch) in enumerate(batches)
         @info "val sample" sample=i
         run_decode_one(model, batch, device, max_len)
@@ -190,7 +195,8 @@ function run_decode_one(model, batch, device, max_len)
     test_spec = device(test_spec)
     ids = decode_autoregressive(model, test_spec; max_len, to_device=device)
     ids_cpu = cpu(ids)  # minimal transfer: token IDs only, for token_ids_to_label (expects CPU indices)
-    truth_ids = batch.targets[1, :]
+    n_tok = batch.target_lengths[1]
+    truth_ids = n_tok > 0 ? batch.targets[1, 1:n_tok] : Int[]
     truth_s = token_ids_to_string_with_speakers(truth_ids)
     seq = [ids_cpu[i, 1] for i in 1:size(ids_cpu, 1)]
     decode_s = token_ids_to_string_with_speakers(seq)
@@ -237,7 +243,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
 
     # Warmup
     for _ in 1:warmup
-        batch = generate_batch_fast(cfg, args.batch_size; rng)
+        batch = generate_chunked_batch(cfg, args.batch_size, rng; max_frames=args.max_frames)
         spec, decoder_input, decoder_target = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
@@ -266,7 +272,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     # Timed run
     for _ in 1:n_steps
         t0 = time()
-        batch = generate_batch_fast(cfg, args.batch_size; rng)
+        batch = generate_chunked_batch(cfg, args.batch_size, rng; max_frames=args.max_frames)
         spec, decoder_input, decoder_target = prepare_training_batch(batch)
         push!(t_data, time() - t0)
 
@@ -345,10 +351,11 @@ function main()
     device = args.gpu ? gpu : cpu
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
-    # Data via MorseSimulator: 200–900 Hz mel, ~10 Hz resolution, time resolution for 50 WPM. max_frames caps time for GPU memory/speed.
-    cfg = SamplerConfig(; max_frames=args.max_frames)
-    batch = generate_batch_fast(cfg, args.batch_size; rng)
-    n_bins = size(batch.spectrogram, 1)
+    # Chunked training: full conversations from simulator, split at [TS]/[TE] into chunks ≤ max_frames.
+    cfg = SamplerConfig(; max_frames=nothing)
+    batch_src = ChunkedBatchSource(cfg, args.batch_size, args.max_frames; rng=args.prefetch > 0 ? MersenneTwister(rand(rng, UInt)) : rng)
+    first_batch, batch_state = iterate(batch_src)
+    n_bins = size(first_batch.spectrogram, 1)
 
     loaded = load_checkpoint(checkpoint_path)
     step_start = 1
@@ -410,8 +417,19 @@ function main()
     end
 
     effective_batch = args.batch_size * args.accum_steps
-    # Several fixed validation batches (different seeds) so we see if decode varies with input
-    val_batches = [generate_batch_fast(cfg, 1; rng=MersenneTwister(s)) for s in [123, 456, 789]]
+    # Validation: one random chunk per full conversation (fixed seeds) so we see different parts, not always the start
+    val_batches = let max_f = args.max_frames
+        [let rng = MersenneTwister(s), rng2 = MersenneTwister(s + 1000)
+            full_sample = generate_sample(cfg; rng)  # full conversation (cfg has max_frames=nothing)
+            chunks = segments_to_chunks(full_sample.spectrogram, full_sample.token_ids, max_f)
+            if isempty(chunks)
+                generate_chunked_batch(cfg, 1, MersenneTwister(s); max_frames=max_f)
+            else
+                idx = rand(rng2, 1:length(chunks))
+                collate([chunks[idx]])
+            end
+        end for s in [123, 456, 789]]
+    end
 
     n_params = count_parameters(model)
     @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
@@ -421,21 +439,30 @@ function main()
         return
     end
 
-    # Prefetched batch producer: one async task fills the channel; each generate_batch uses
-    # Threads.nthreads() (run with -t N). Pre-fill queue so GPU has a buffer before we start.
+    # Prefetched batch producer: single ChunkedBatchSource; first batch already taken for n_bins.
     batch_channel = nothing
+    batch_pending = first_batch
+    batch_iter_state = batch_state
     if args.prefetch > 0
         batch_channel = Channel{Any}(args.prefetch)
         sync_prefill = Channel{Nothing}(1)
         @async begin
+            put!(batch_channel, first_batch)
             prefill = min(args.prefetch, args.steps - step_start + 1)
-            for _ in 1:prefill
-                put!(batch_channel, generate_batch_fast(cfg, args.batch_size; rng))
+            state = batch_state
+            for i in 2:prefill
+                it = iterate(batch_src, state)
+                it === nothing && break
+                batch, state = it
+                put!(batch_channel, batch)
             end
             put!(sync_prefill, nothing)
             remaining = args.steps - step_start + 1 - prefill
             for _ in 1:remaining
-                put!(batch_channel, generate_batch_fast(cfg, args.batch_size; rng))
+                it = iterate(batch_src, state)
+                it === nothing && break
+                batch, state = it
+                put!(batch_channel, batch)
             end
             close(batch_channel)
         end
@@ -449,7 +476,17 @@ function main()
     loss_sum = 0.0f0
 
     for step in step_start:args.steps
-        batch = args.prefetch > 0 ? take!(batch_channel) : generate_batch_fast(cfg, args.batch_size; rng)
+        if args.prefetch > 0
+            batch = take!(batch_channel)
+        else
+            if batch_pending !== nothing
+                batch = batch_pending
+                batch_pending = nothing
+            else
+                it = iterate(batch_src, batch_iter_state)
+                batch, batch_iter_state = it
+            end
+        end
         spec, decoder_input, decoder_target = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)

@@ -37,7 +37,7 @@ batch = generate_batch_fast(cfg, 32; rng)
 
 - **Band:** 200–900 Hz only (Morse CW); no need for wider bandwidth.
 - **Frequency resolution:** ~10 Hz (fft_size=4096 @ 44.1 kHz) so signals “up 10” / “down 10” are separable.
-- **Time resolution:** hop_size=256 @ 44.1 kHz (~5.8 ms/frame), enough for dots vs dashes up to 50 WPM.
+- **Time resolution:** hop_size=128 @ 44.1 kHz (~2.9 ms/frame), 4–5+ frames per dot for dots vs dashes up to ~80 WPM.
 
 Configured in `SamplerConfig()` via MorseSimulator’s `DatasetConfig` (see `src/sampler.jl`).
 
@@ -81,6 +81,30 @@ julia -t 4 --project=. examples/benchmark_data.jl 64
 ```
 
 Compare “batches/sec” to your training steps/sec (from the “steps_per_sec” log). If batches/sec is lower, increase `--prefetch` or run with more threads (`-t N`). If it’s still too low, options are: reduce `max_frames` or batch size, or add a batch-oriented API in the simulator that reuses buffers (preallocated mel matrices, reuse of scene/transcript structures) and call that from a small “batch producer” functor here. Right now there is no such API; the benchmark tells you whether you need it.
+
+## Training speed
+
+**What "steps per second" means:** e.g. **0.58 steps/sec** = about **1.7 seconds per step** (1 ÷ 0.58). So 1000 steps ≈ 29 minutes, 10k steps ≈ 4.8 hours.
+
+**Find where time goes:** run a short benchmark with timing breakdown (no training, no checkpoint):
+
+```bash
+julia -t 4 --project=. examples/train.jl --gpu --benchmark 50
+```
+
+Logs will show **Timing (ms)** for: **data** (batch generation), **transfer** (CPU→GPU), **forward_backward** (model + loss + backward), **accum_update** (gradient accumulation + optimizer). The script prints a **Bottleneck** hint (e.g. "GPU compute dominates" or "Data generation is a significant share").
+
+**Ways to improve:**
+
+| If the bottleneck is… | Try |
+|------------------------|-----|
+| **Data** | Use more threads: `julia -t 4` (or 8) and ensure `--prefetch` is ≥ 2. Compare with `examples/benchmark_data.jl 64` to see max batches/sec you can supply. |
+| **Forward/backward (GPU)** | Increase `--batch` if GPU memory allows (e.g. 64 or 128). If OOM, use `--batch 32` or `--max-frames 256`. Fewer, larger steps often give better GPU utilization. |
+| **Decode / save** | Reduce how often you run decode or save: e.g. `--decode-every 1000` or `0`, `--save-every 1000`. |
+| **First steps slow** | Early steps include JIT compile; reported steps_per_sec is over the whole run. Use `--benchmark` after warmup for a stable number. |
+| **Too many frames** | The encoder frontend has a single 2× time downsampling (≈4 encoder frames per dot at 50 WPM); that is the minimum for reliable dot vs dash. To reduce memory/speed, use `--max-frames 256` (or 384) instead of adding more downsampling. |
+
+Always run with **multiple threads** when using prefetch: `julia -t 4 --project=. examples/train.jl --gpu --steps 5000` so the batch producer can overlap with GPU work.
 
 ## Troubleshooting
 

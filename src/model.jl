@@ -387,10 +387,12 @@ train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
 # ─── Autoregressive sampling ───────────────────────────────────────────────────
 
 """
-    decode_autoregressive(model, spec; max_len, start_token, to_device, batch_size)
+    decode_autoregressive(model, spec; max_len, start_token, to_device, batch_size, initial_tokens)
 
 Single-stream decode: one output sequence per spectrogram (with speaker tokens). Stops at EOS or max_len.
 Returns (seq_len, batch) token indices. to_device(x) places x on the same device as spec.
+When `initial_tokens` is provided (vector of token IDs), decoding continues from that prefix
+(batch_size must be 1); useful for chunk-by-chunk conversation decoding and streaming.
 """
 function decode_autoregressive(
     model::SpectrogramEncoderDecoder,
@@ -399,14 +401,21 @@ function decode_autoregressive(
     start_token::Int = START_TOKEN_IDX,
     to_device = identity,
     batch_size::Int = size(spec, 2),
+    initial_tokens = nothing,
 )
-    _, memory = encode(model, spec)  # decoder uses projected memory when encoder_dim != decoder_dim
-    # Preallocate (max_len, batch) to avoid O(max_len) allocations from repeated cat
+    _, memory = encode(model, spec)
     ids_buf = to_device(fill(start_token, max_len, batch_size))
     len_so_far = 1
 
-    for _ in 2:max_len
-        ids_so_far = copy(ids_buf[1:len_so_far, :])  # contiguous; decoder Embedding on GPU needs plain array, not view
+    if initial_tokens !== nothing
+        P = length(initial_tokens)
+        P >= max_len && return to_device(reshape(collect(initial_tokens), P, 1))[1:max_len, :]
+        ids_buf[1:P, 1] .= initial_tokens
+        len_so_far = P
+    end
+
+    for _ in (len_so_far + 1):max_len
+        ids_so_far = copy(ids_buf[1:len_so_far, :])
         logits = model.decoder(ids_so_far, memory)
         next_logits = selectdim(logits, 2, size(logits, 2))
         next_logits[PAD_TOKEN_IDX, :] .= -1f10
@@ -417,8 +426,47 @@ function decode_autoregressive(
         all(==(EOS_TOKEN_IDX), next_ids) && break
     end
 
-    ids_buf[1:len_so_far, :]  # return slice (caller typically cpu() next, so view vs copy irrelevant)
+    ids_buf[1:len_so_far, :]
 end
+
+"""
+    decode_conversation(model, chunks, to_device; max_len_per_chunk, start_token)
+
+Decode a full conversation from an iterable of spectrogram chunks (e.g. from
+`ChunkedConversation` or streaming). Runs autoregressive decode chunk by chunk;
+each chunk continues from the previous output (using [TS]/[TE] and EOS). Stops when
+EOS is emitted or chunks are exhausted. Returns a single token-id vector.
+Use for long-form decode and future streaming inference (e.g. radio).
+"""
+function decode_conversation(
+    model::SpectrogramEncoderDecoder,
+    chunks,
+    to_device = identity;
+    max_len_per_chunk::Int = 256,
+    start_token::Int = START_TOKEN_IDX,
+)
+    tokens = [start_token]
+    for chunk in chunks
+        # Accept (n_bins, time) or (n_bins, 1, time); model expects (n_bins, batch, time)
+        spec_3d = ndims(chunk) == 2 ? reshape(chunk, size(chunk, 1), 1, size(chunk, 2)) : chunk
+        out = decode_autoregressive(
+            model, spec_3d;
+            initial_tokens = tokens,
+            max_len = max_len_per_chunk,
+            to_device = to_device,
+            batch_size = 1,
+        )
+        tokens = vec(collect(out))
+        if !isempty(tokens) && tokens[end] == EOS_TOKEN_IDX
+            break
+        end
+    end
+    tokens
+end
+
+# Accept ChunkedConversation (yields Sample); forward to spectrogram iterable.
+decode_conversation(model::SpectrogramEncoderDecoder, chunks::ChunkedConversation, to_device = identity; kws...) =
+    decode_conversation(model, (s.spectrogram for s in chunks), to_device; kws...)
 
 # Argmax along dim 1 (vocab) via KernelAbstractions; avoids CuArray's tuple reduction (isless/convert) that fails on some GPUs.
 @kernel function argmax_dim1_kernel(logits, out)
