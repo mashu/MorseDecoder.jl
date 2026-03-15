@@ -2,3 +2,4 @@
 *.wav
 *.txt
 Manifest.toml
+checkpoints/*
