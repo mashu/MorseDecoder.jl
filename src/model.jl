@@ -455,11 +455,15 @@ end
 """
     decode_conversation(model, chunks, to_device; max_len_per_chunk, start_token)
 
-Decode a full conversation from an iterable of spectrogram chunks (e.g. from
-`ChunkedConversation` or streaming). Runs autoregressive decode chunk by chunk;
-each chunk continues from the previous output (using [TS]/[TE] and EOS). Stops when
-EOS is emitted or chunks are exhausted. Returns a single token-id vector.
-Use for long-form decode and future streaming inference (e.g. radio).
+Decode a full conversation from an iterable of spectrogram chunks. Runs autoregressive
+decode chunk by chunk; each chunk continues from the previous output (using [TS]/[TE]
+and EOS). Stops when EOS is emitted or chunks are exhausted. Returns a single token-id vector.
+
+**Chunk source is abstract:** `chunks` can be from the simulator (`ChunkedConversation`),
+from live audio (mic/radio), or from files. Each element must be a spectrogram array:
+either (n_bins, time) or (n_bins, 1, time), with the same n_bins and scale as training.
+For real audio use `compute_spectrogram` then `spectrogram_to_model_scale` before
+slicing into chunks so the scale matches the encoder.
 """
 function decode_conversation(
     model::SpectrogramEncoderDecoder,

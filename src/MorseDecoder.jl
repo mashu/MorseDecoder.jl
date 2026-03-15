@@ -36,6 +36,7 @@ using CTCLoss  # model.jl calls CTCLoss.ctc_loss_batched, CTCLoss.ctc_greedy_dec
 include("morse.jl")           # ALPHABET, NUM_CHARS, CHAR_TO_IDX, IDX_TO_CHAR
 include("vocab.jl")           # token IDs for simulator labels (<START>, [S1]..[S6], [TS], [TE])
 include("spectrogram.jl")     # STFT for inference on real audio
+include("audio.jl")           # Live mic input → spectrogram chunks for decode_conversation
 include("sampler.jl")          # Sample, Batch (must be before model.jl)
 include("model.jl")           # encoder–decoder (Onion + Flux)
 include("viz.jl")             # plots
@@ -74,6 +75,9 @@ export
 
     # CTC (uses CTCLoss.jl; blank = CTC_BLANK_IDX)
     CTC_VOCAB_SIZE, CTC_BLANK_IDX,
-    prepare_ctc_targets, ctc_greedy_decode
+    prepare_ctc_targets, ctc_greedy_decode,
+
+    # Live audio (mic) for inference
+    mic_spectrogram_config, MicSpectrogramSource, open_mic_input
 
 end # module MorseDecoder
