@@ -12,9 +12,9 @@ Labels use simulator tokens: <START>, <END>, [S1]..[S6], [TS], [TE].
 using MorseDecoder, Random
 
 rng = MersenneTwister(42)
-cfg = SamplerConfig()   # 200–900 Hz, ~10 Hz resolution, max_frames=512
-s   = generate_sample(cfg; rng)
-batch = generate_batch_fast(cfg, 32; rng)
+cfg = SamplerConfig()   # 200–900 Hz, ~10 Hz resolution
+s   = generate_sample(cfg; rng)   # one full conversation
+batch = generate_chunked_batch(cfg, 32, rng; max_frames=512)   # one batch of chunks
 ```
 
 # Chunked training and decoding

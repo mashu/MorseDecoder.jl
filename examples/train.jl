@@ -177,17 +177,31 @@ function run_decode_test(model, batch, device; max_len::Int=128)
     run_decode_one(model, batch, device, max_len)
 end
 
-"""Run decode on each of several batches; show ground truth for one random chunk."""
-function run_decode_test(model, batches::AbstractVector, device; max_len::Int=128)
+"""Run decode on each of several batches (single-chunk decode); optionally run full-conversation decode (chunk-by-chunk)."""
+function run_decode_test(model, batches::AbstractVector, device; max_len::Int=128, full_conversation=nothing)
     idx = rand(1:length(batches))
     b = batches[idx]
     truth_ids = b.targets[1, 1:b.target_lengths[1]]
     truth_s = token_ids_to_string_with_speakers(truth_ids)
     @info "ground_truth (random chunk)" chunk_index=idx truth=(isempty(truth_s) ? "(empty)" : truth_s)
     for (i, batch) in enumerate(batches)
-        @info "val sample" sample=i
+        @info "val sample (single chunk)" sample=i
         run_decode_one(model, batch, device, max_len)
     end
+    if full_conversation !== nothing
+        spec, token_ids, max_frames = full_conversation
+        @info "full_conversation decode" max_frames
+        run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk=max_len)
+    end
+end
+
+"""Decode a full conversation chunk-by-chunk (decode_conversation); log truth vs decoder."""
+function run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk::Int=128)
+    truth_s = token_ids_to_string_with_speakers(token_ids)
+    chunks = ChunkedConversation(spec, token_ids, max_frames)
+    decoded_ids = decode_conversation(model, chunks, device; max_len_per_chunk)
+    decode_s = token_ids_to_string_with_speakers(decoded_ids)
+    @info "decode (full conversation)" truth=(isempty(truth_s) ? "(empty)" : truth_s) decoder=(isempty(decode_s) ? "(empty)" : decode_s)
 end
 
 function run_decode_one(model, batch, device, max_len)
@@ -417,10 +431,10 @@ function main()
     end
 
     effective_batch = args.batch_size * args.accum_steps
-    # Validation: one random chunk per full conversation (fixed seeds) so we see different parts, not always the start
-    val_batches = let max_f = args.max_frames
-        [let rng = MersenneTwister(s), rng2 = MersenneTwister(s + 1000)
-            full_sample = generate_sample(cfg; rng)  # full conversation (cfg has max_frames=nothing)
+    # Validation: one random chunk per full conversation (fixed seeds); plus one full conversation for chunk-by-chunk decode
+    val_batches, val_full = let max_f = args.max_frames
+        batches = [let rng = MersenneTwister(s), rng2 = MersenneTwister(s + 1000)
+            full_sample = generate_sample(cfg; rng)
             chunks = segments_to_chunks(full_sample.spectrogram, full_sample.token_ids, max_f)
             if isempty(chunks)
                 generate_chunked_batch(cfg, 1, MersenneTwister(s); max_frames=max_f)
@@ -429,6 +443,9 @@ function main()
                 collate([chunks[idx]])
             end
         end for s in [123, 456, 789]]
+        full_sample = generate_sample(cfg; rng = MersenneTwister(999))
+        full_conv = (full_sample.spectrogram, full_sample.token_ids, max_f)
+        (batches, full_conv)
     end
 
     n_params = count_parameters(model)
@@ -535,7 +552,7 @@ function main()
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
-                run_decode_test(model, val_batches, device)
+                run_decode_test(model, val_batches, device; full_conversation=val_full)
             end
         end
     end
@@ -552,9 +569,9 @@ function main()
         save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
     end
 
-    # Final decode test on fixed validation (same as during training)
+    # Final decode test: single-chunk decode on 3 val batches + full-conversation chunk-by-chunk decode
     @info "Decode test" n_spectrograms=3
-    run_decode_test(model, val_batches, device)
+    run_decode_test(model, val_batches, device; full_conversation=val_full)
 end
 
 main()

@@ -106,15 +106,18 @@ function SpectrogramEncoder(
     SpectrogramEncoder(frontend, proj, blocks, norm, rope)
 end
 
+function apply_encoder_proj(proj::Dense, h)
+    T_enc, B = size(h, 2), size(h, 3)
+    out = proj(reshape(h, size(h, 1), :))
+    reshape(out, size(out, 1), T_enc, B)
+end
+apply_encoder_proj(::Nothing, h) = h
+
 function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
     x = permutedims(spec, (3, 1, 2))   # (time, freq_bins, batch)
     h = enc.frontend(x)                 # (T/2, 128, batch)
     h = permutedims(h, (2, 1, 3))      # (128, T/2, batch)
-    if enc.proj !== nothing
-        T_enc, B = size(h, 2), size(h, 3)
-        h = enc.proj(reshape(h, size(h, 1), :))
-        h = reshape(h, size(h, 1), T_enc, B)  # (dim, T/2, batch)
-    end
+    h = apply_encoder_proj(enc.proj, h)
     n_tokens = size(h, 2)
     rope = enc.rope[1:n_tokens]
     for block in enc.blocks
@@ -324,11 +327,10 @@ Truncates so encoder length (spectrogram ÷ ENCODER_DOWNSAMPLE) >= 2*L+1 for CTC
 Targets vary per sample and per batch (each batch has different random transcripts from MorseSimulator).
 """
 function prepare_ctc_targets(batch::Batch)
-    enc_lengths = div.(batch.input_lengths, ENCODER_DOWNSAMPLE)
-    _prepare_ctc_targets_inner(batch, enc_lengths)
+    prepare_ctc_targets(batch, div.(batch.input_lengths, ENCODER_DOWNSAMPLE))
 end
 
-function _prepare_ctc_targets_inner(batch::Batch, enc_lengths::Vector{Int})
+function prepare_ctc_targets(batch::Batch, enc_lengths::Vector{Int})
     B = size(batch.targets, 1)
     ctc_targets = Vector{Vector{Int}}(undef, B)
     for b in 1:B
@@ -386,34 +388,16 @@ train_step(model::SpectrogramEncoderDecoder, batch::Batch; kws...) =
 
 # ─── Autoregressive sampling ───────────────────────────────────────────────────
 
-"""
-    decode_autoregressive(model, spec; max_len, start_token, to_device, batch_size, initial_tokens)
-
-Single-stream decode: one output sequence per spectrogram (with speaker tokens). Stops at EOS or max_len.
-Returns (seq_len, batch) token indices. to_device(x) places x on the same device as spec.
-When `initial_tokens` is provided (vector of token IDs), decoding continues from that prefix
-(batch_size must be 1); useful for chunk-by-chunk conversation decoding and streaming.
-"""
-function decode_autoregressive(
+"""Shared loop: run decoder from (memory, ids_buf, len_so_far) until max_len or EOS. Returns ids_buf[1:len_so_far, :]."""
+function autoregressive_loop(
     model::SpectrogramEncoderDecoder,
-    spec;
-    max_len::Int = 256,
-    start_token::Int = START_TOKEN_IDX,
+    memory,
+    ids_buf,
+    len_so_far::Int;
+    max_len::Int,
     to_device = identity,
-    batch_size::Int = size(spec, 2),
-    initial_tokens = nothing,
 )
-    _, memory = encode(model, spec)
-    ids_buf = to_device(fill(start_token, max_len, batch_size))
-    len_so_far = 1
-
-    if initial_tokens !== nothing
-        P = length(initial_tokens)
-        P >= max_len && return to_device(reshape(collect(initial_tokens), P, 1))[1:max_len, :]
-        ids_buf[1:P, 1] .= initial_tokens
-        len_so_far = P
-    end
-
+    batch_size = size(ids_buf, 2)
     for _ in (len_so_far + 1):max_len
         ids_so_far = copy(ids_buf[1:len_so_far, :])
         logits = model.decoder(ids_so_far, memory)
@@ -425,8 +409,47 @@ function decode_autoregressive(
         ids_buf[len_so_far, :] .= vec(next_ids)
         all(==(EOS_TOKEN_IDX), next_ids) && break
     end
-
     ids_buf[1:len_so_far, :]
+end
+
+"""
+    decode_autoregressive(model, spec; max_len, start_token, to_device, batch_size)
+
+Single-stream decode: one output sequence per spectrogram (with speaker tokens). Stops at EOS or max_len.
+Returns (seq_len, batch) token indices.
+"""
+function decode_autoregressive(
+    model::SpectrogramEncoderDecoder,
+    spec;
+    max_len::Int = 256,
+    start_token::Int = START_TOKEN_IDX,
+    to_device = identity,
+    batch_size::Int = size(spec, 2),
+)
+    _, memory = encode(model, spec)
+    ids_buf = to_device(fill(start_token, max_len, batch_size))
+    autoregressive_loop(model, memory, ids_buf, 1; max_len, to_device)
+end
+
+"""
+    decode_autoregressive(model, spec, initial_tokens; max_len, to_device, batch_size)
+
+Decode continuing from prefix `initial_tokens` (for chunk-by-chunk conversation decoding).
+"""
+function decode_autoregressive(
+    model::SpectrogramEncoderDecoder,
+    spec,
+    initial_tokens::AbstractVector{<:Integer};
+    max_len::Int = 256,
+    to_device = identity,
+    batch_size::Int = 1,
+)
+    _, memory = encode(model, spec)
+    P = length(initial_tokens)
+    P >= max_len && return to_device(reshape(collect(initial_tokens), P, 1))[1:max_len, :]
+    ids_buf = to_device(fill(START_TOKEN_IDX, max_len, batch_size))
+    ids_buf[1:P, 1] .= initial_tokens
+    autoregressive_loop(model, memory, ids_buf, P; max_len, to_device)
 end
 
 """
@@ -447,11 +470,9 @@ function decode_conversation(
 )
     tokens = [start_token]
     for chunk in chunks
-        # Accept (n_bins, time) or (n_bins, 1, time); model expects (n_bins, batch, time)
-        spec_3d = ndims(chunk) == 2 ? reshape(chunk, size(chunk, 1), 1, size(chunk, 2)) : chunk
+        spec_3d = spec_for_decode(chunk)
         out = decode_autoregressive(
-            model, spec_3d;
-            initial_tokens = tokens,
+            model, spec_3d, tokens;
             max_len = max_len_per_chunk,
             to_device = to_device,
             batch_size = 1,
@@ -463,6 +484,10 @@ function decode_conversation(
     end
     tokens
 end
+
+# Dispatch: (n_bins, time) → (n_bins, 1, time); already 3D passed through.
+spec_for_decode(spec::AbstractMatrix) = reshape(spec, size(spec, 1), 1, size(spec, 2))
+spec_for_decode(spec::AbstractArray{<:Any,3}) = spec
 
 # Accept ChunkedConversation (yields Sample); forward to spectrogram iterable.
 decode_conversation(model::SpectrogramEncoderDecoder, chunks::ChunkedConversation, to_device = identity; kws...) =
