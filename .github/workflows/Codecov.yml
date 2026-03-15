@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone dependencies
+      - name: Clone unregistered dependencies
         run: |
           git clone https://github.com/mashu/MorseSimulator.jl.git ../MorseSimulator.jl
           git clone https://github.com/mashu/CTCLoss.jl.git ../CTCLoss.jl
@@ -24,7 +24,10 @@ jobs:
           version: '1.11'
 
       - name: Install dependencies
-        run: julia --project=. -e 'using Pkg; Pkg.add(path="../MorseSimulator.jl"); Pkg.develop(path="../CTCLoss.jl"); Pkg.instantiate()'
+        run: julia --project=. -e 'using Pkg; Pkg.develop(path="../CTCLoss.jl"); Pkg.add(path="../MorseSimulator.jl"); Pkg.instantiate()'
+        env:
+          JULIA_PKG_SERVER: ""
+
 
       - name: Run tests with coverage
         run: julia --project=. --code-coverage=user -e 'using Pkg; Pkg.test()'
