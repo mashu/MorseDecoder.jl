@@ -26,13 +26,11 @@ struct SpectrogramConfig
     hop::Int
     freq_lo::Float32
     freq_hi::Float32
-    """Max time frames (optional). When set, training spectrograms are capped to this length to keep GPU memory bounded."""
-    max_frames::Union{Int,Nothing}
 end
 
 # nfft=1024 → ~7.8 Hz; hop=64 → 8 ms/frame, ~3 frames/dit at 50 WPM for reliable dit/dash
-SpectrogramConfig(; nfft=1024, hop=64, freq_lo=200f0, freq_hi=800f0, max_frames=nothing) =
-    SpectrogramConfig(nfft, hop, freq_lo, freq_hi, max_frames)
+SpectrogramConfig(; nfft=1024, hop=64, freq_lo=200f0, freq_hi=800f0) =
+    SpectrogramConfig(nfft, hop, freq_lo, freq_hi)
 
 """Number of frequency bins in the configured band for sample rate `sr`."""
 function num_bins(cfg::SpectrogramConfig, sr::Int)
@@ -52,7 +50,7 @@ hann(n::Int) = Float32[0.5f0 * (1f0 - cospi(2f0 * k / (n - 1))) for k in 0:n-1]
 
 # ─── Thread-local workspace (reuse window, buffer, FFT plan) ─────────────────
 
-"""Thread-local cache keyed by nfft; parametric on plan type P, no typeof/isa."""
+"""Thread-local cache keyed by nfft; parametric on plan type P."""
 struct SpectrogramWorkspace{P}
     nfft::Int
     win::Vector{Float32}

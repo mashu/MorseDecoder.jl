@@ -15,31 +15,33 @@ using Random
 using MorseSimulator: DatasetConfig, DirectPath, generate_sample as sim_generate_sample,
     AbstractTokenTiming, TokenTiming, NoTiming
 
-# ─── Sample and config ───────────────────────────────────────────────────────
+# ─── Sample (parametric on timing type for type stability) ───────────────────
 
 """
 A single training example from MorseSimulator.
 
 - `spectrogram` : (n_mels × n_frames) Float32 — mel spectrogram in 200–900 Hz band.
 - `token_ids`   : target sequence (label_to_token_ids(sample.label)).
-- `token_timing` : AbstractTokenTiming (TokenTiming or NoTiming) for dispatch in chunking.
+- `token_timing` : TokenTiming or NoTiming — dispatch key for chunking alignment.
 """
-struct Sample
+struct Sample{TT<:AbstractTokenTiming}
     spectrogram::Matrix{Float32}
     token_ids::Vector{Int}
-    token_timing::AbstractTokenTiming
+    token_timing::TT
 end
+
 Sample(spec::Matrix{Float32}, ids::Vector{Int}) = Sample(spec, ids, NoTiming())
+
+# ─── SamplerConfig ───────────────────────────────────────────────────────────
 
 """
 Configuration for training data.
 
-- `dataset_config` : MorseSimulator.DatasetConfig (band 200–900 Hz, fft/hop for ~10 Hz and 50 WPM).
-- `max_frames`     : unused by generate_sample; chunk size is passed to ChunkedBatchSource / ChunkedSampleSource.
+`dataset_config` : MorseSimulator.DatasetConfig (band 200–900 Hz, fft/hop for ~10 Hz and 50 WPM).
+Chunk size (max_frames) is passed directly to ChunkedBatchSource / ChunkedSampleSource.
 """
 struct SamplerConfig
     dataset_config::DatasetConfig
-    max_frames::Union{Int,Nothing}
 end
 
 # 200–900 Hz only (Morse CW). ~10 Hz freq resolution → fft_size ≥ sr/10 (44100/10=4410 → 4096).
@@ -53,13 +55,12 @@ function SamplerConfig(;
     f_min::Float64 = 200.0,
     f_max::Float64 = 900.0,
     stations::UnitRange{Int} = 2:4,
-    max_frames::Union{Int,Nothing} = 512,
 )
     dataset_config = DatasetConfig(;
         path, sample_rate, fft_size, hop_size,
         n_mels, f_min, f_max, stations,
     )
-    SamplerConfig(dataset_config, max_frames)
+    SamplerConfig(dataset_config)
 end
 
 # ─── Single sample ───────────────────────────────────────────────────────────
@@ -69,8 +70,7 @@ end
 
 One full conversation from MorseSimulator (spectrogram + label as token_ids).
 No truncation: chunked training uses ChunkedSampleSource / ChunkedBatchSource with a
-max_frames chunk size instead. For bounded-length batches use generate_chunked_batch or
-iterate ChunkedBatchSource(cfg, batch_size, max_frames; rng).
+max_frames chunk size instead.
 """
 function generate_sample(cfg::SamplerConfig; rng::AbstractRNG = Random.default_rng())
     ds = sim_generate_sample(rng, cfg.dataset_config)
@@ -88,19 +88,15 @@ Padded batch for the network.
 - `targets`        : (batch, max_seq) — token IDs, zero-padded
 - `target_lengths` : (batch,)
 - `input_lengths`  : (batch,) — spectrogram time length per sample
-- `n_stations`     : (batch,) — from metadata when available
-- `frequencies`    : (batch, max_ns) — not used with simulator, zeros
 """
 struct Batch
     spectrogram::Array{Float32,3}
     targets::Array{Int,2}
     target_lengths::Vector{Int}
     input_lengths::Vector{Int}
-    n_stations::Vector{Int}
-    frequencies::Matrix{Float32}
 end
 
-function collate(samples::AbstractVector{Sample})
+function collate(samples::AbstractVector{<:Sample})
     B = length(samples)
     max_time = maximum(size(s.spectrogram, 2) for s in samples)
     n_bins = size(first(samples).spectrogram, 1)
@@ -110,8 +106,6 @@ function collate(samples::AbstractVector{Sample})
     tgt_batch = zeros(Int, B, max_seq)
     tgt_lens = zeros(Int, B)
     in_lens = zeros(Int, B)
-    ns_vec = zeros(Int, B)
-    freq_batch = zeros(Float32, B, 6)
 
     @inbounds for (b, s) in enumerate(samples)
         T = size(s.spectrogram, 2)
@@ -121,14 +115,15 @@ function collate(samples::AbstractVector{Sample})
         tgt_batch[b, 1:tgt_lens[b]] .= s.token_ids
     end
 
-    Batch(spec_batch, tgt_batch, tgt_lens, in_lens, ns_vec, freq_batch)
+    Batch(spec_batch, tgt_batch, tgt_lens, in_lens)
 end
+
+# ─── Batch generation ────────────────────────────────────────────────────────
 
 """
     generate_batch(cfg, batch_size; rng, parallel) → Batch
-    generate_batch_fast(cfg, batch_size; rng, parallel) → Batch
 
-Generate and collate a batch using MorseSimulator. Both names supported.
+Generate and collate a batch of full conversations using MorseSimulator.
 """
 function generate_batch(cfg::SamplerConfig, batch_size::Int;
                        rng::AbstractRNG = Random.default_rng(),
@@ -145,9 +140,6 @@ function generate_batch(cfg::SamplerConfig, batch_size::Int;
         collate([generate_sample(cfg; rng) for _ in 1:batch_size])
     end
 end
-
-generate_batch_fast(cfg::SamplerConfig, batch_size::Int; rng::AbstractRNG = Random.default_rng(), parallel::Bool = Threads.nthreads() > 1) =
-    generate_batch(cfg, batch_size; rng, parallel)
 
 # ─── Chunked training: iterable conversation → chunks (≤ max_frames) ───────────
 
@@ -180,53 +172,78 @@ function transmission_segments(token_ids::Vector{Int})
     out
 end
 
-"""
-    segments_to_chunks(spec, token_ids, max_frames) -> Vector{Sample}
+# ─── Dispatch-based alignment for chunking ───────────────────────────────────
+# Instead of runtime `nothing` checks, dispatch on AbstractTokenTiming.
 
-Split one long (spec, token_ids) into training samples with ≤ max_frames, using
-transmission boundaries ([TS]..[TE]). Proportional mapping: token range (a,b) maps to
-frames round((a-1)*T/L)+1 : round(b*T/L). If a segment is longer than max_frames,
-subdivide its frame range into max_frames-sized windows and assign token spans proportionally
-(so we may cut mid-word within a long transmission, but never at [TS]/[TE]).
-Each chunk's token sequence is wrapped as START + segment + EOS for a valid decoder sequence.
-Uses dispatch for spec slice: no conversion when spec is already Matrix{Float32}.
+"""Frame range for a transmission segment — proportional mapping."""
+function segment_frame_range(tok_start::Int, tok_end::Int, n_total_frames::Int, n_total_tokens::Int, ::NoTiming)
+    f_start = max(1, round(Int, (tok_start - 1) * n_total_frames / n_total_tokens) + 1)
+    f_end = min(n_total_frames, round(Int, tok_end * n_total_frames / n_total_tokens))
+    (f_start, f_end)
+end
 
-**Alignment:** Use `segments_to_chunks(spec, token_ids, max_frames, timing)` with
-`timing::TokenTiming` for exact alignment; `NoTiming()` or the 3-arg form for proportional.
-"""
+"""Frame range for a transmission segment — exact alignment from simulator timings."""
+function segment_frame_range(tok_start::Int, tok_end::Int, n_total_frames::Int, ::Int, timing::TokenTiming)
+    f_start = clamp(timing.token_start_frames[tok_start], 1, n_total_frames)
+    f_end = clamp(timing.token_end_frames[tok_end], 1, n_total_frames)
+    (f_start, f_end)
+end
+
+"""Token range for a sub-chunk — proportional mapping."""
+function subchunk_token_range(tok_start::Int, tok_end::Int, c::Int, n_chunks::Int,
+                              ::Int, ::Int, ::NoTiming)
+    t1 = tok_start + round(Int, (c - 1) * (tok_end - tok_start + 1) / n_chunks)
+    t2 = (c == n_chunks) ? tok_end : (tok_start + round(Int, c * (tok_end - tok_start + 1) / n_chunks) - 1)
+    (max(tok_start, t1), min(tok_end, t2))
+end
+
+"""Token range for a sub-chunk — exact overlap rule from simulator timings."""
+function subchunk_token_range(tok_start::Int, tok_end::Int, ::Int, ::Int,
+                              cf_start::Int, cf_end::Int, timing::TokenTiming)
+    st = timing.token_start_frames
+    en = timing.token_end_frames
+    t1 = tok_start
+    while t1 <= tok_end && en[t1] < cf_start
+        t1 += 1
+    end
+    t2 = tok_end
+    while t2 >= tok_start && st[t2] > cf_end
+        t2 -= 1
+    end
+    (t1, t2)
+end
+
+# ─── Spec slice dispatch ────────────────────────────────────────────────────
+
 chunk_spec_slice(spec::Matrix{Float32}, r) = spec[:, r]
 chunk_spec_slice(spec::AbstractMatrix, r) = Float32.(spec[:, r])
 
-# Single implementation. When timing is provided: include every token that *overlaps* the chunk's
-# frame range (so a letter spanning a chunk boundary appears in both chunks). Else proportional.
-function segments_to_chunks_impl(
-    spec::AbstractMatrix,
-    token_ids::Vector{Int},
-    max_frames::Int,
-    start_frames::Union{Nothing, Vector{Int}},
-    end_frames::Union{Nothing, Vector{Int}},
-)
-    T = size(spec, 2)
+# ─── Main chunking function (single method, dispatches on timing) ───────────
+
+"""
+    segments_to_chunks(spec, token_ids, max_frames, timing) -> Vector{Sample}
+
+Split one long (spec, token_ids) into training samples with ≤ max_frames, using
+transmission boundaries ([TS]..[TE]). Alignment mode (proportional vs exact) is
+selected by dispatch on `timing::AbstractTokenTiming`.
+
+Each chunk's token sequence is wrapped as START + segment + EOS for a valid decoder sequence.
+"""
+function segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int},
+                            max_frames::Int, timing::AbstractTokenTiming)
+    T_frames = size(spec, 2)
     L = length(token_ids)
-    L == 0 && return Sample[]
+    L == 0 && return Sample{NoTiming}[]
     segs = transmission_segments(token_ids)
     isempty(segs) && (segs = [(1, L)])
-    use_exact = start_frames !== nothing && end_frames !== nothing &&
-        length(start_frames) == L && length(end_frames) == L
-    st = use_exact ? start_frames : Int[]
-    en = use_exact ? end_frames : Int[]
-    out = Sample[]
+
+    out = Sample{NoTiming}[]
     for (tok_start, tok_end) in segs
-        if use_exact
-            f_start = clamp(st[tok_start], 1, T)
-            f_end = clamp(en[tok_end], 1, T)
-        else
-            f_start = max(1, round(Int, (tok_start - 1) * T / L) + 1)
-            f_end = min(T, round(Int, tok_end * T / L))
-        end
+        f_start, f_end = segment_frame_range(tok_start, tok_end, T_frames, L, timing)
         n_frames = f_end - f_start + 1
         seg_tokens = token_ids[tok_start:tok_end]
         chunk_tokens = [START_TOKEN_IDX; seg_tokens; EOS_TOKEN_IDX]
+
         if n_frames <= max_frames
             push!(out, Sample(chunk_spec_slice(spec, f_start:f_end), chunk_tokens))
         else
@@ -234,22 +251,7 @@ function segments_to_chunks_impl(
             for c in 1:n_chunks
                 cf_start = f_start + (c - 1) * max_frames
                 cf_end = min(f_end, f_start + c * max_frames - 1)
-                if use_exact
-                    # Overlap rule: include token i iff [st[i], en[i]] overlaps [cf_start, cf_end]
-                    t1 = tok_start
-                    while t1 <= tok_end && en[t1] < cf_start
-                        t1 += 1
-                    end
-                    t2 = tok_end
-                    while t2 >= tok_start && st[t2] > cf_end
-                        t2 -= 1
-                    end
-                else
-                    t1 = tok_start + round(Int, (c - 1) * (tok_end - tok_start + 1) / n_chunks)
-                    t2 = (c == n_chunks) ? tok_end : (tok_start + round(Int, c * (tok_end - tok_start + 1) / n_chunks) - 1)
-                    t1 = max(tok_start, t1)
-                    t2 = min(tok_end, t2)
-                end
+                t1, t2 = subchunk_token_range(tok_start, tok_end, c, n_chunks, cf_start, cf_end, timing)
                 if t2 >= t1
                     sub_tokens = [START_TOKEN_IDX; token_ids[t1:t2]; EOS_TOKEN_IDX]
                     push!(out, Sample(chunk_spec_slice(spec, cf_start:cf_end), sub_tokens))
@@ -260,15 +262,9 @@ function segments_to_chunks_impl(
     out
 end
 
+# Convenience: 3-arg defaults to NoTiming
 segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int) =
-    segments_to_chunks_impl(spec, token_ids, max_frames, nothing, nothing)
-
-segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int, ::NoTiming) =
-    segments_to_chunks_impl(spec, token_ids, max_frames, nothing, nothing)
-
-function segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int, timing::TokenTiming)
-    segments_to_chunks_impl(spec, token_ids, max_frames, timing.token_start_frames, timing.token_end_frames)
-end
+    segments_to_chunks(spec, token_ids, max_frames, NoTiming())
 
 # ─── Chunked iterators (conversation → chunks → batches) ───────────────────────
 # Standard iteration interface: iterate(iter), iterate(iter, state), IteratorSize,
@@ -278,8 +274,7 @@ end
     ChunkedConversation(spec, token_ids, max_frames)
 
 Iterable over `Sample` chunks of one conversation. Splits at [TS]/[TE] boundaries
-so chunks never cut mid-turn; each chunk has ≤ max_frames. Use when you have a
-full (spec, token_ids) and want to process or decode it chunk by chunk (e.g. streaming).
+so chunks never cut mid-turn; each chunk has ≤ max_frames.
 """
 struct ChunkedConversation{S,T}
     spec::S
@@ -292,21 +287,20 @@ function Base.iterate(cc::ChunkedConversation)
     isempty(chunks) ? nothing : (chunks[1], (chunks, 2))
 end
 
-function Base.iterate(cc::ChunkedConversation, state)
+function Base.iterate(::ChunkedConversation, state)
     chunks, i = state
     i > length(chunks) ? nothing : (chunks[i], (chunks, i + 1))
 end
 
 Base.IteratorSize(::Type{<:ChunkedConversation}) = Base.SizeUnknown()
 Base.IteratorEltype(::Type{<:ChunkedConversation}) = Base.HasEltype()
-Base.eltype(::Type{<:ChunkedConversation}) = Sample
+Base.eltype(::Type{<:ChunkedConversation}) = Sample{NoTiming}
 
 """
     ChunkedSampleSource(cfg, max_frames; rng)
 
 Infinite iterator of `Sample` chunks. Generates full conversations via the simulator,
-splits them with `ChunkedConversation`, and yields chunks; when a conversation is
-exhausted, the next is generated. Use as the source for batched training.
+splits them with timing-aware chunking, and yields chunks one at a time.
 """
 mutable struct ChunkedSampleSource{C,R}
     cfg::C
@@ -317,33 +311,33 @@ end
 ChunkedSampleSource(cfg, max_frames::Int; rng::AbstractRNG = Random.default_rng()) =
     ChunkedSampleSource(cfg, max_frames, rng)
 
-function Base.iterate(src::ChunkedSampleSource)
-    s = generate_sample(src.cfg; rng = src.rng)
-    chunks = segments_to_chunks(s.spectrogram, s.token_ids, src.max_frames, s.token_timing)
-    while isempty(chunks)
-        s = generate_sample(src.cfg; rng = src.rng)
-        chunks = segments_to_chunks(s.spectrogram, s.token_ids, src.max_frames, s.token_timing)
+# Shared logic: generate conversations until we get non-empty chunks, then yield next chunk.
+function next_chunk(src::ChunkedSampleSource, chunks, i::Int)
+    if i <= length(chunks)
+        return (chunks[i], (chunks, i + 1))
     end
-    (chunks[1], (chunks, 2))
+    # Current conversation exhausted; generate new one
+    while true
+        s = generate_sample(src.cfg; rng = src.rng)
+        new_chunks = segments_to_chunks(s.spectrogram, s.token_ids, src.max_frames, s.token_timing)
+        if !isempty(new_chunks)
+            return (new_chunks[1], (new_chunks, 2))
+        end
+    end
+end
+
+function Base.iterate(src::ChunkedSampleSource)
+    next_chunk(src, Sample{NoTiming}[], 1)  # empty chunks forces generation
 end
 
 function Base.iterate(src::ChunkedSampleSource, state)
     chunks, i = state
-    if i <= length(chunks)
-        return (chunks[i], (chunks, i + 1))
-    end
-    s = generate_sample(src.cfg; rng = src.rng)
-    chunks = segments_to_chunks(s.spectrogram, s.token_ids, src.max_frames, s.token_timing)
-    while isempty(chunks)
-        s = generate_sample(src.cfg; rng = src.rng)
-        chunks = segments_to_chunks(s.spectrogram, s.token_ids, src.max_frames, s.token_timing)
-    end
-    (chunks[1], (chunks, 2))
+    next_chunk(src, chunks, i)
 end
 
 Base.IteratorSize(::Type{<:ChunkedSampleSource}) = Base.IsInfinite()
 Base.IteratorEltype(::Type{<:ChunkedSampleSource}) = Base.HasEltype()
-Base.eltype(::Type{<:ChunkedSampleSource}) = Sample
+Base.eltype(::Type{<:ChunkedSampleSource}) = Sample{NoTiming}
 
 """
     ChunkedBatchSource(cfg, batch_size, max_frames; rng)
@@ -376,13 +370,12 @@ Base.IteratorSize(::Type{<:ChunkedBatchSource}) = Base.IsInfinite()
 Base.IteratorEltype(::Type{<:ChunkedBatchSource}) = Base.HasEltype()
 Base.eltype(::Type{<:ChunkedBatchSource}) = Batch
 
-# ─── Convenience constructors (same types as above) ───────────────────────────
+# ─── Convenience constructors ─────────────────────────────────────────────────
 
 """
-    chunked_samples(cfg [ , rng ]; max_frames=512)
+    chunked_samples(cfg [, rng]; max_frames=512)
 
-Return a `ChunkedSampleSource` (infinite iterator of `Sample` chunks). Each chunk has
-≤ max_frames and is split at [TS]/[TE] boundaries.
+Return a `ChunkedSampleSource` (infinite iterator of `Sample` chunks).
 """
 chunked_samples(cfg::SamplerConfig, rng::AbstractRNG = Random.default_rng(); max_frames::Int = 512) =
     ChunkedSampleSource(cfg, max_frames; rng)
@@ -390,7 +383,7 @@ chunked_samples(cfg::SamplerConfig, rng::AbstractRNG = Random.default_rng(); max
 """
     generate_chunked_batch(cfg, batch_size, rng; max_frames=512) -> Batch
 
-One batch of chunked samples: takes batch_size from a ChunkedBatchSource and collates.
+One batch of chunked samples.
 """
 function generate_chunked_batch(cfg::SamplerConfig, batch_size::Int, rng::AbstractRNG; max_frames::Int = 512)
     batch, _ = iterate(ChunkedBatchSource(cfg, batch_size, max_frames; rng))

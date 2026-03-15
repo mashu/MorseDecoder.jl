@@ -28,13 +28,20 @@ freq_hi is set so that the linear band has 40 bins; use the same sample_rate as 
 """
 function mic_spectrogram_config(sample_rate::Int; n_bins::Int = 40, hop::Int = DEFAULT_MIC_HOP, nfft::Int = DEFAULT_MIC_NFFT)
     freq_lo = 200f0
-    # Linear FFT: bin width = sample_rate/nfft; n_bins => freq_hi = freq_lo + (n_bins-1)*bin_width
     bin_width_hz = Float32(sample_rate / nfft)
     freq_hi = freq_lo + (n_bins - 1) * bin_width_hz
-    SpectrogramConfig(; nfft, hop, freq_lo, freq_hi, max_frames = nothing)
+    SpectrogramConfig(; nfft, hop, freq_lo, freq_hi)
 end
 
-# ─── Mic stream → iterable of spectrogram chunks ─────────────────────────────────────
+# ─── Audio buffer → mono Float32 (dispatch, no isa check) ────────────────────
+
+"""Convert multi-channel read buffer to mono Float32 vector."""
+audio_to_mono_float(buf::AbstractMatrix) = Float32.(vec(buf[1, :]))
+
+"""Convert single-channel read buffer to mono Float32 vector."""
+audio_to_mono_float(buf::AbstractVector) = Float32.(vec(buf))
+
+# ─── Mic stream → iterable of spectrogram chunks ─────────────────────────────
 
 """
     MicSpectrogramSource(stream, spec_config; chunk_seconds)
@@ -60,12 +67,12 @@ function MicSpectrogramSource(stream, spec_config::SpectrogramConfig; chunk_seco
     MicSpectrogramSource(stream, spec_config, chunk_seconds)
 end
 
-function Base.iterate(src::MicSpectrogramSource)
+# Single implementation; both iterate signatures delegate here.
+function read_mic_chunk(src::MicSpectrogramSource)
     isopen(src.stream) || return nothing
     sr = Int(samplerate(src.stream))
     n_samples = max(1, round(Int, src.chunk_seconds * sr))
     buf = read(src.stream, n_samples)
-    # SampledSignals may return SampleBuf or array-like; get mono Float32
     audio = audio_to_mono_float(buf)
     length(audio) < src.spec_config.nfft && return nothing
     spec = compute_spectrogram(audio, sr, src.spec_config)
@@ -73,26 +80,11 @@ function Base.iterate(src::MicSpectrogramSource)
     (spec_scaled, nothing)
 end
 
-function Base.iterate(src::MicSpectrogramSource, _)
-    isopen(src.stream) || return nothing
-    sr = Int(samplerate(src.stream))
-    n_samples = max(1, round(Int, src.chunk_seconds * sr))
-    buf = read(src.stream, n_samples)
-    audio = audio_to_mono_float(buf)
-    length(audio) < src.spec_config.nfft && return nothing
-    spec = compute_spectrogram(audio, sr, src.spec_config)
-    spec_scaled = spectrogram_to_model_scale(spec)
-    (spec_scaled, nothing)
-end
+Base.iterate(src::MicSpectrogramSource) = read_mic_chunk(src)
+Base.iterate(src::MicSpectrogramSource, _) = read_mic_chunk(src)
 
 Base.IteratorSize(::Type{<:MicSpectrogramSource}) = Base.SizeUnknown()
 Base.IteratorEltype(::Type{<:MicSpectrogramSource}) = Base.EltypeUnknown()
-
-"""Convert read buffer (SampleBuf or array) to mono Float32 vector."""
-function audio_to_mono_float(buf)
-    a = buf isa AbstractMatrix ? vec(buf[1, :]) : vec(buf)
-    Float32.(a)
-end
 
 """
     open_mic_input(; sample_rate, input_channels)

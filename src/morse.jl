@@ -48,7 +48,7 @@ end
 # ─── Keying envelope ────────────────────────────────────────────────────────
 
 # Conservative upper bound: lead 3dit + per char at most ~25 dits (5 dahs + gaps) + trail 3dit
-_envelope_upper_bound(dit::Int, text_len::Int) = 6dit + max(1000, text_len * 28 * dit)
+envelope_upper_bound(dit::Int, text_len::Int) = 6dit + max(1000, text_len * 28 * dit)
 
 """
     keying_envelope(text, wpm, sr, jitter, rng) → Vector{Float32}
@@ -61,7 +61,7 @@ function keying_envelope(text::AbstractString, wpm::Real, sr::Int,
     dit = dit_samples(wpm, sr)
     j(n) = jittered(n, jitter, rng)
 
-    cap = _envelope_upper_bound(dit, length(text))
+    cap = envelope_upper_bound(dit, length(text))
     out = Vector{Float32}(undef, cap)
     pos = 1
 

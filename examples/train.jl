@@ -364,7 +364,7 @@ function main()
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
     # Chunked training: full conversations from simulator, split at [TS]/[TE] into chunks ≤ max_frames.
-    cfg = SamplerConfig(; max_frames=nothing)
+    cfg = SamplerConfig()
     batch_src = ChunkedBatchSource(cfg, args.batch_size, args.max_frames; rng=args.prefetch > 0 ? MersenneTwister(rand(rng, UInt)) : rng)
     first_batch, batch_state = iterate(batch_src)
     n_bins = size(first_batch.spectrogram, 1)

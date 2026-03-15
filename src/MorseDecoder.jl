@@ -29,16 +29,18 @@ module MorseDecoder
 using Random
 using FFTW: rfft, plan_rfft
 using CairoMakie
-using CTCLoss  # model.jl calls CTCLoss.ctc_loss_batched, CTCLoss.ctc_greedy_decode
 
 # ── Source files (order matters) ─────────────────────────────────────────────
 
 include("morse.jl")           # ALPHABET, NUM_CHARS, CHAR_TO_IDX, IDX_TO_CHAR
-include("vocab.jl")           # token IDs for simulator labels (<START>, [S1]..[S6], [TS], [TE])
+include("vocab.jl")           # token IDs, CTC constants
 include("spectrogram.jl")     # STFT for inference on real audio
 include("audio.jl")           # Live mic input → spectrogram chunks for decode_conversation
-include("sampler.jl")          # Sample, Batch (must be before model.jl)
-include("model.jl")           # encoder–decoder (Onion + Flux)
+include("sampler.jl")         # Sample, Batch (must be before model.jl)
+include("model.jl")           # encoder–decoder architecture (Onion + Flux)
+include("loss.jl")            # sequence_cross_entropy
+include("training.jl")        # prepare_decoder_batch, train_step, CTC targets
+include("decode.jl")          # autoregressive decode, CTC greedy decode
 include("viz.jl")             # plots
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -54,28 +56,36 @@ export
     SPEAKER_1_IDX, speaker_token_id, is_speaker_token,
     TS_TOKEN_IDX, TE_TOKEN_IDX,
 
+    # CTC vocabulary constants
+    CTC_VOCAB_SIZE, CTC_BLANK_IDX,
+
     # Spectrogram (inference on WAV)
     SpectrogramConfig, compute_spectrogram, num_bins, num_frames,
     spectrogram_to_model_scale,
 
     # Sampler (MorseSimulator)
     Sample, SamplerConfig, generate_sample,
-    Batch, collate, generate_batch, generate_batch_fast,
+    Batch, collate, generate_batch,
     transmission_segments, segments_to_chunks, chunked_samples, generate_chunked_batch,
     ChunkedConversation, ChunkedSampleSource, ChunkedBatchSource,
 
     # Visualization
     plot_spectrogram, plot_chunk,
 
-    # Model
+    # Model architecture
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,
     encode, ENCODER_DOWNSAMPLE,
-    prepare_decoder_batch, prepare_training_batch, train_step,
-    decode_autoregressive, decode_conversation, sequence_cross_entropy,
 
-    # CTC (uses CTCLoss.jl; blank = CTC_BLANK_IDX)
-    CTC_VOCAB_SIZE, CTC_BLANK_IDX,
-    prepare_ctc_targets, ctc_greedy_decode,
+    # Loss
+    sequence_cross_entropy,
+
+    # Training
+    prepare_decoder_batch, prepare_training_batch, train_step,
+    prepare_ctc_targets,
+
+    # Decoding
+    decode_autoregressive, decode_conversation,
+    ctc_greedy_decode,
 
     # Live audio (mic) for inference
     mic_spectrogram_config, MicSpectrogramSource, open_mic_input
