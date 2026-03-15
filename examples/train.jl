@@ -6,8 +6,6 @@
 #
 # Benchmarking: julia -t 4 --project=. examples/train.jl --gpu --benchmark 50 [--batch 32]
 #   Use -t N (N>1) so batch generation runs in parallel. If OOM, use --batch 32.
-# GPU kernel profiling: nsys launch julia -t 4 --project=. examples/profile_gpu.jl --profile --batch 32 --steps 5
-#   Then open report.qdrep in nsight-sys to see which kernels dominate.
 
 using ArgParse
 using Logging

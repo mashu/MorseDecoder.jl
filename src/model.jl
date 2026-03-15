@@ -448,7 +448,7 @@ function decode_autoregressive(
     P = length(initial_tokens)
     P >= max_len && return to_device(reshape(collect(initial_tokens), P, 1))[1:max_len, :]
     ids_buf = to_device(fill(START_TOKEN_IDX, max_len, batch_size))
-    ids_buf[1:P, 1] .= initial_tokens
+    ids_buf[1:P, 1] .= vec(to_device(collect(Int, initial_tokens)))
     autoregressive_loop(model, memory, ids_buf, P; max_len, to_device)
 end
 
@@ -470,7 +470,7 @@ function decode_conversation(
 )
     tokens = [start_token]
     for chunk in chunks
-        spec_3d = spec_for_decode(chunk)
+        spec_3d = to_device(spec_for_decode(chunk))
         out = decode_autoregressive(
             model, spec_3d, tokens;
             max_len = max_len_per_chunk,
