@@ -7,8 +7,6 @@
 
 Training pipeline for a spectrogram encoder–decoder that decodes multi-station CW Morse. Uses **[MorseSimulator.jl](https://github.com/mashu/MorseSimulator.jl)** for data (200–900 Hz mel spectrograms, ~10 Hz resolution, 50 WPM) and **[CTCLoss.jl](https://github.com/mashu/CTCLoss.jl)** for CTC loss and decoding.
 
-**Documentation:** [stable](https://mashu.github.io/MorseDecoder.jl/stable) | [dev](https://mashu.github.io/MorseDecoder.jl/dev)
-
 ## Installation
 
 Clone [MorseSimulator.jl](https://github.com/mashu/MorseSimulator.jl) and [CTCLoss.jl](https://github.com/mashu/CTCLoss.jl) next to this repo, then from the MorseDecoder.jl directory:
@@ -27,9 +25,3 @@ cfg = SamplerConfig()
 s = generate_sample(cfg; rng)
 batch = generate_chunked_batch(cfg, 32, rng; max_frames=512)
 ```
-
-For installation details, spectrogram resolution, label tokens, data throughput, training speed, and troubleshooting, see the **[documentation](https://mashu.github.io/MorseDecoder.jl/stable)**.
-
-## License
-
-See `Project.toml` for authors and version.

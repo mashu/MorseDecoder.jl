@@ -23,20 +23,20 @@ jobs:
         with:
           version: '1.11'
 
-      - name: Install dependencies
-        run: julia --project=. -e 'using Pkg; Pkg.develop(path="../CTCLoss.jl"); Pkg.add(path="../MorseSimulator.jl"); Pkg.instantiate()'
-        env:
-          JULIA_PKG_SERVER: ""
-
-
-      - name: Run tests with coverage
-        run: julia --project=. --code-coverage=user -e 'using Pkg; Pkg.test()'
-        env:
-          JULIA_PKG_SERVER: ""
-
-      - name: Generate lcov and submit to Codecov
+      - name: Install, test with coverage, generate lcov (single process to avoid get_uuid_name bug)
         run: |
-          julia --project=. -e 'using Pkg; Pkg.add("Coverage"); using Coverage; data = process_folder(); LCOV.write("lcov.info", data)'
+          julia --project=. --code-coverage=user -e '
+            using Pkg
+            Pkg.Registry.add("General")
+            Pkg.Registry.add(url="https://github.com/MurrellGroup/MurrellGroupRegistry")
+            Pkg.develop([Pkg.PackageSpec(path="../CTCLoss.jl"), Pkg.PackageSpec(path="../MorseSimulator.jl")])
+            Pkg.instantiate()
+            Pkg.test()
+            Pkg.add("Coverage")
+            using Coverage
+            data = process_folder()
+            LCOV.write("lcov.info", data)
+          '
         env:
           JULIA_PKG_SERVER: ""
 

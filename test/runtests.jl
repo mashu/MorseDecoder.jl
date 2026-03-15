@@ -1,4 +1,5 @@
 using MorseDecoder
+using Random
 using Test
 
 @testset "MorseDecoder.jl" begin

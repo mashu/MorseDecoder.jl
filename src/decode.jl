@@ -37,7 +37,7 @@ function argmax_dim1(logits)
         reshape(Int.(out), 1, batch_size)
     else
         am = argmax(logits; dims=1)
-        reshape(map(first, am), 1, size(logits, 2))
+        reshape([am[i][1] for i in eachindex(am)], 1, size(logits, 2))
     end
 end
 

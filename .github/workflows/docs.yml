@@ -25,19 +25,20 @@ jobs:
         with:
           version: '1.11'
 
-      - name: Install dependencies
-        run: julia --project=. -e 'using Pkg; Pkg.develop(path="../CTCLoss.jl"); Pkg.add(path="../MorseSimulator.jl"); Pkg.instantiate()'
-        env:
-          JULIA_PKG_SERVER: ""
-
-      - name: Build documentation
-        run: julia --project=docs -e '
-          using Pkg
-          Pkg.develop(path="..")
-          Pkg.instantiate()
-          include("make.jl")
-        '
-        working-directory: docs
+      - name: Install dependencies and build docs (single process to avoid get_uuid_name bug)
+        run: |
+          julia -e '
+            using Pkg
+            Pkg.Registry.add("General")
+            Pkg.Registry.add(url="https://github.com/MurrellGroup/MurrellGroupRegistry")
+            Pkg.activate(".")
+            Pkg.develop([Pkg.PackageSpec(path="../CTCLoss.jl"), Pkg.PackageSpec(path="../MorseSimulator.jl")])
+            Pkg.instantiate()
+            Pkg.activate("docs")
+            Pkg.develop(path=".")  # repo root (cwd) is MorseDecoder.jl
+            Pkg.instantiate()
+            include("docs/make.jl")
+          '
         env:
           JULIA_PKG_SERVER: ""
 

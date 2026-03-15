@@ -16,13 +16,13 @@
     # Round-trip
     @test decode_indices(encode_text("HELLO")) == "HELLO"
 
-    # Timing
-    @test dit_samples(20, 44100) > 0
-    @test envelope_upper_bound(100, 10) > 100
+    # Timing (internal API)
+    @test MorseDecoder.dit_samples(20, 44100) > 0
+    @test MorseDecoder.envelope_upper_bound(100, 10) > 100
 
     # Keying envelope (no jitter for reproducibility)
     rng = MersenneTwister(42)
-    env = keying_envelope("A", 20, 44100, 0f0, rng)
+    env = MorseDecoder.keying_envelope("A", 20, 44100, 0f0, rng)
     @test eltype(env) == Float32
     @test length(env) >= 1
     @test all(x -> x == 0f0 || x == 1f0, env)

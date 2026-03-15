@@ -213,7 +213,7 @@ SpectrogramEncoderDecoder(encoder, decoder, ctc_head) =
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head, nothing)
 
 function SpectrogramEncoderDecoder(encoder::SpectrogramEncoder, decoder::SpectrogramDecoder)
-    dim = size(decoder.embed.weight, 2)
+    dim = size(decoder.embed.weight, 1)  # embedding dimension (Flux Embedding weight is (dim, vocab_size))
     SpectrogramEncoderDecoder(encoder, decoder, Dense(dim => CTC_VOCAB_SIZE), nothing)
 end
 
