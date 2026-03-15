@@ -1,0 +1,46 @@
+name: Codecov
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone dependencies
+        run: |
+          git clone https://github.com/mashu/MorseSimulator.jl.git ../MorseSimulator.jl
+          git clone https://github.com/mashu/CTCLoss.jl.git ../CTCLoss.jl
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.11'
+
+      - name: Install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.add(path="../MorseSimulator.jl"); Pkg.develop(path="../CTCLoss.jl"); Pkg.instantiate()'
+
+      - name: Run tests with coverage
+        run: julia --project=. --code-coverage=user -e 'using Pkg; Pkg.test()'
+        env:
+          JULIA_PKG_SERVER: ""
+
+      - name: Generate lcov and submit to Codecov
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.add("Coverage"); using Coverage; data = process_folder(); LCOV.write("lcov.info", data)'
+        env:
+          JULIA_PKG_SERVER: ""
+
+      - name: Submit to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true

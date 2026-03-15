@@ -3,3 +3,5 @@
 *.txt
 Manifest.toml
 checkpoints/*
+docs/build
+docs/site

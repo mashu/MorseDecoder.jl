@@ -34,6 +34,7 @@ CTCLoss = "0.1"
 CUDA = "5.9.7"
 CannotWaitForTheseOptimisers = "0.1.3"
 ChainRulesCore = "1.26.0"
+Documenter = "1.6"
 JLD2 = "0.6.3"
 KernelAbstractions = "0.9"
 MorseSimulator = "0.1.0"
@@ -41,3 +42,11 @@ Onion = "0.2.18"
 ParameterSchedulers = "0.4.3"
 UnicodePlots = "3.8.1"
 cuDNN = "1.4.6"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Documenter = "e30172b5-a6a5-5a46-863b-614d45cd2de4"
+
+[targets]
+test = ["Test"]
+docs = ["Documenter"]

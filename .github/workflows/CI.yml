@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Julia 1.11
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone dependencies
+        run: |
+          git clone https://github.com/mashu/MorseSimulator.jl.git ../MorseSimulator.jl
+          git clone https://github.com/mashu/CTCLoss.jl.git ../CTCLoss.jl
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.11'
+
+      - name: Install dependencies and run tests
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.add(path="../MorseSimulator.jl"); Pkg.develop(path="../CTCLoss.jl"); Pkg.instantiate()'
+          julia --project=. -e 'using Pkg; Pkg.test()'
+        env:
+          JULIA_PKG_SERVER: ""

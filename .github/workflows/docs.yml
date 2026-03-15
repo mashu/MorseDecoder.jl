@@ -1,0 +1,61 @@
+name: Documenter
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    name: Build and deploy docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone dependencies
+        run: |
+          git clone https://github.com/mashu/MorseSimulator.jl.git ../MorseSimulator.jl
+          git clone https://github.com/mashu/CTCLoss.jl.git ../CTCLoss.jl
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v1
+        with:
+          version: '1.11'
+
+      - name: Install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.add(path="../MorseSimulator.jl"); Pkg.develop(path="../CTCLoss.jl"); Pkg.instantiate()'
+
+      - name: Build documentation
+        run: julia --project=docs -e '
+          using Pkg
+          Pkg.develop(path="..")
+          Pkg.add(path="../MorseSimulator.jl")
+          Pkg.develop(path="../CTCLoss.jl")
+          Pkg.instantiate()
+          include("make.jl")
+        '
+        working-directory: docs
+        env:
+          JULIA_PKG_SERVER: ""
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/build
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment: github-pages
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
