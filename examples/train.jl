@@ -194,16 +194,18 @@ function run_decode_test(model, batches::AbstractVector, device; max_len::Int=12
         run_decode_one(model, batch, device, max_len)
     end
     if full_conversation !== nothing
-        spec, token_ids, max_frames = full_conversation
+        spec, token_ids, max_frames = full_conversation[1], full_conversation[2], full_conversation[3]
+        timing = length(full_conversation) >= 4 ? full_conversation[4] : nothing
         @info "full_conversation decode" max_frames
-        run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk=max_len)
+        run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk=max_len, timing=timing)
     end
 end
 
-"""Decode a full conversation chunk-by-chunk (decode_conversation); log truth vs decoder."""
-function run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk::Int=128)
+"""Decode a full conversation chunk-by-chunk (decode_conversation); log truth vs decoder.
+When `timing` is provided (e.g. from simulator), chunk boundaries use exact token-frame alignment."""
+function run_decode_conversation(model, spec, token_ids, max_frames, device; max_len_per_chunk::Int=128, timing=nothing)
     truth_s = token_ids_to_string_with_speakers(token_ids)
-    chunks = ChunkedConversation(spec, token_ids, max_frames)
+    chunks = timing !== nothing ? ChunkedConversation(spec, token_ids, max_frames; timing) : ChunkedConversation(spec, token_ids, max_frames)
     decoded_ids = decode_conversation(model, chunks, device; max_len_per_chunk)
     decode_s = token_ids_to_string_with_speakers(decoded_ids)
     @info "decode (full conversation)" truth=(isempty(truth_s) ? "(empty)" : truth_s) decoder=(isempty(decode_s) ? "(empty)" : decode_s)
@@ -448,7 +450,7 @@ function main()
     val_batches, val_full = let max_f = args.max_frames
         batches = [let rng = MersenneTwister(s), rng2 = MersenneTwister(s + 1000)
             full_sample = generate_sample(cfg; rng)
-            chunks = segments_to_chunks(full_sample.spectrogram, full_sample.token_ids, max_f)
+            chunks = segments_to_chunks(full_sample.spectrogram, full_sample.token_ids, max_f, full_sample.token_timing)
             if isempty(chunks)
                 generate_chunked_batch(cfg, 1, MersenneTwister(s); max_frames=max_f)
             else
@@ -457,7 +459,7 @@ function main()
             end
         end for s in [123, 456, 789]]
         full_sample = generate_sample(cfg; rng = MersenneTwister(999))
-        full_conv = (full_sample.spectrogram, full_sample.token_ids, max_f)
+        full_conv = (full_sample.spectrogram, full_sample.token_ids, max_f, full_sample.token_timing)
         (batches, full_conv)
     end
 

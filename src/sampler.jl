@@ -241,6 +241,7 @@ function segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int},
     for (tok_start, tok_end) in segs
         f_start, f_end = segment_frame_range(tok_start, tok_end, T_frames, L, timing)
         n_frames = f_end - f_start + 1
+        n_frames <= 0 && continue  # skip invalid alignment (e.g. timing gives f_start > f_end)
         seg_tokens = token_ids[tok_start:tok_end]
         chunk_tokens = [START_TOKEN_IDX; seg_tokens; EOS_TOKEN_IDX]
 
@@ -271,19 +272,28 @@ segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int
 # IteratorEltype, eltype (https://docs.julialang.org/en/v1/manual/interfaces/#Iteration).
 
 """
-    ChunkedConversation(spec, token_ids, max_frames)
+    ChunkedConversation(spec, token_ids, max_frames; timing=NoTiming())
+    ChunkedConversation(sample::Sample, max_frames)
 
 Iterable over `Sample` chunks of one conversation. Splits at [TS]/[TE] boundaries
 so chunks never cut mid-turn; each chunk has ≤ max_frames.
+When the simulator provides timing, pass it (e.g. via `ChunkedConversation(sample, max_frames)`)
+so chunk boundaries use exact token-frame alignment instead of proportional.
 """
 struct ChunkedConversation{S,T}
     spec::S
     token_ids::T
     max_frames::Int
+    timing::AbstractTokenTiming
 end
 
+ChunkedConversation(spec, token_ids, max_frames::Int; timing::AbstractTokenTiming=NoTiming()) =
+    ChunkedConversation(spec, token_ids, max_frames, timing)
+ChunkedConversation(sample::Sample, max_frames::Int) =
+    ChunkedConversation(sample.spectrogram, sample.token_ids, max_frames, sample.token_timing)
+
 function Base.iterate(cc::ChunkedConversation)
-    chunks = segments_to_chunks(cc.spec, cc.token_ids, cc.max_frames)
+    chunks = segments_to_chunks(cc.spec, cc.token_ids, cc.max_frames, cc.timing)
     isempty(chunks) ? nothing : (chunks[1], (chunks, 2))
 end
 
