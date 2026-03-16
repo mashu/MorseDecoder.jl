@@ -416,8 +416,9 @@ function main()
     end
 
     if args.nan_track
-        @info "NaN tracking enabled (no checkpoint load/save)"
+        @info "NaN tracking enabled (no checkpoint load/save); stats enabled to show layer norms/maxabs on NaN"
         model = nantrack(model)
+        NaNTracker.enable_stats!(; capacity=5000)  # ~4 entries per wrapped layer per step; on NaN last 40 entries dumped to stderr
         # Optimiser state must match the tracked model (NaNCheck has path/layer, not σ/weight/bias)
         opt = Flux.setup(Muon(eta=args.lr), model)
         args.gpu && (opt = device(opt))
@@ -508,6 +509,7 @@ function main()
     loss_sum = 0.0f0
 
     for step in step_start:args.steps
+        args.nan_track && NaNTracker.clear_stats!()  # so NaN dump shows only this step's trajectory (which layer exploded)
         if args.prefetch > 0
             batch = take!(batch_channel)
         else
