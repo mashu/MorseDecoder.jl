@@ -22,7 +22,7 @@ A single training example from MorseSimulator.
 
 - `spectrogram` : (n_mels × n_frames) Float32 — mel spectrogram in 200–900 Hz band.
 - `token_ids`   : target sequence (label_to_token_ids(sample.label)).
-- `token_timing` : TokenTiming or NoTiming — dispatch key for chunking alignment.
+- `token_timing` : TokenTiming from simulator (exact chunk alignment) or NoTiming (no chunks yielded).
 """
 struct Sample{TT<:AbstractTokenTiming}
     spectrogram::Matrix{Float32}
@@ -172,29 +172,14 @@ function transmission_segments(token_ids::Vector{Int})
     out
 end
 
-# ─── Dispatch-based alignment for chunking ───────────────────────────────────
-# Instead of runtime `nothing` checks, dispatch on AbstractTokenTiming.
-
-"""Frame range for a transmission segment — proportional mapping."""
-function segment_frame_range(tok_start::Int, tok_end::Int, n_total_frames::Int, n_total_tokens::Int, ::NoTiming)
-    f_start = max(1, round(Int, (tok_start - 1) * n_total_frames / n_total_tokens) + 1)
-    f_end = min(n_total_frames, round(Int, tok_end * n_total_frames / n_total_tokens))
-    (f_start, f_end)
-end
+# ─── Chunking: exact alignment from simulator timings only ─────────────────────
+# No proportional fallback; simulator provides TokenTiming. NoTiming => no chunks.
 
 """Frame range for a transmission segment — exact alignment from simulator timings."""
 function segment_frame_range(tok_start::Int, tok_end::Int, n_total_frames::Int, ::Int, timing::TokenTiming)
     f_start = clamp(timing.token_start_frames[tok_start], 1, n_total_frames)
     f_end = clamp(timing.token_end_frames[tok_end], 1, n_total_frames)
     (f_start, f_end)
-end
-
-"""Token range for a sub-chunk — proportional mapping."""
-function subchunk_token_range(tok_start::Int, tok_end::Int, c::Int, n_chunks::Int,
-                              ::Int, ::Int, ::NoTiming)
-    t1 = tok_start + round(Int, (c - 1) * (tok_end - tok_start + 1) / n_chunks)
-    t2 = (c == n_chunks) ? tok_end : (tok_start + round(Int, c * (tok_end - tok_start + 1) / n_chunks) - 1)
-    (max(tok_start, t1), min(tok_end, t2))
 end
 
 """Token range for a sub-chunk — exact overlap rule from simulator timings."""
@@ -224,13 +209,16 @@ chunk_spec_slice(spec::AbstractMatrix, r) = Float32.(spec[:, r])
     segments_to_chunks(spec, token_ids, max_frames, timing) -> Vector{Sample}
 
 Split one long (spec, token_ids) into training samples with ≤ max_frames, using
-transmission boundaries ([TS]..[TE]). Alignment mode (proportional vs exact) is
-selected by dispatch on `timing::AbstractTokenTiming`.
-
-Each chunk's token sequence is wrapped as START + segment + EOS for a valid decoder sequence.
+transmission boundaries ([TS]..[TE]). Uses **exact** token-frame alignment from
+simulator timings (TokenTiming) only. When timing is NoTiming() (e.g. simulator
+alignment failed), returns [] so that sample is skipped — no proportional fallback.
+Each chunk's token sequence is wrapped as START + segment + EOS.
 """
+segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int, ::NoTiming) =
+    Sample{NoTiming}[]
+
 function segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int},
-                            max_frames::Int, timing::AbstractTokenTiming)
+                            max_frames::Int, timing::TokenTiming)
     T_frames = size(spec, 2)
     L = length(token_ids)
     L == 0 && return Sample{NoTiming}[]
@@ -263,7 +251,7 @@ function segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int},
     out
 end
 
-# Convenience: 3-arg defaults to NoTiming
+# No timing => no chunks (caller can use this when timing is not available)
 segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int) =
     segments_to_chunks(spec, token_ids, max_frames, NoTiming())
 
@@ -277,8 +265,8 @@ segments_to_chunks(spec::AbstractMatrix, token_ids::Vector{Int}, max_frames::Int
 
 Iterable over `Sample` chunks of one conversation. Splits at [TS]/[TE] boundaries
 so chunks never cut mid-turn; each chunk has ≤ max_frames.
-When the simulator provides timing, pass it (e.g. via `ChunkedConversation(sample, max_frames)`)
-so chunk boundaries use exact token-frame alignment instead of proportional.
+Uses exact token-frame alignment from simulator (TokenTiming) only; with NoTiming
+yields no chunks. Prefer `ChunkedConversation(sample, max_frames)` when you have a Sample.
 """
 struct ChunkedConversation{S,T}
     spec::S
