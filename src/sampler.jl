@@ -182,22 +182,22 @@ function segment_frame_range(tok_start::Int, tok_end::Int, n_total_frames::Int, 
     (f_start, f_end)
 end
 
-"""Token range for a sub-chunk — exact overlap rule from simulator timings."""
+"""Token range for a sub-chunk — midpoint rule: each token assigned to exactly one chunk."""
 function subchunk_token_range(tok_start::Int, tok_end::Int, ::Int, ::Int,
                               cf_start::Int, cf_end::Int, timing::TokenTiming)
     st = timing.token_start_frames
     en = timing.token_end_frames
-    t1 = tok_start
-    while t1 <= tok_end && en[t1] < cf_start
-        t1 += 1
-    end
-    t2 = tok_end
-    while t2 >= tok_start && st[t2] > cf_end
-        t2 -= 1
+    t1 = tok_end + 1   # sentinel: no token found yet
+    t2 = tok_start - 1  # sentinel: no token found yet
+    for t in tok_start:tok_end
+        mid = div(st[t] + en[t], 2)
+        if mid >= cf_start && mid <= cf_end
+            t1 = min(t1, t)
+            t2 = max(t2, t)
+        end
     end
     (t1, t2)
 end
-
 # ─── Spec slice dispatch ────────────────────────────────────────────────────
 
 chunk_spec_slice(spec::Matrix{Float32}, r) = spec[:, r]
