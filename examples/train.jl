@@ -23,6 +23,7 @@ using JLD2
 using ChainRulesCore
 using UnicodePlots
 using CannotWaitForTheseOptimisers
+using NaNTracker
 
 # Multi-step gradient accumulation: sum grads over N steps then one optimizer update.
 # Uses ChainRulesCore.add!! for in-place accumulation when possible (AD-agnostic).
@@ -127,6 +128,9 @@ function parse_commandline()
         help = "If >0, run N steps with timing breakdown then exit (no checkpoint/decode)"
         arg_type = Int
         default = 0
+        "--nan-track"
+        help = "Wrap model with NaNTracker to find where NaN appears in forward/backward (debug only; no checkpoint load/save)"
+        action = :store_true
         "--ctc-weight"
         help = "Weight for CTC loss (0 = no CTC). Light nudge (e.g. 0.05–0.1) keeps attention dominant; default 0.1"
         arg_type = Float32
@@ -156,7 +160,7 @@ function parse_commandline()
       decoder_layers, cross_layers, n_heads = parsed["n-heads"],
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
-      benchmark = parsed["benchmark"],
+      benchmark = parsed["benchmark"], nan_track = parsed["nan-track"],
       ctc_weight, label_smoothing = parsed["label-smoothing"])
 end
 
@@ -369,7 +373,7 @@ function main()
     first_batch, batch_state = iterate(batch_src)
     n_bins = size(first_batch.spectrogram, 1)
 
-    loaded = load_checkpoint(checkpoint_path)
+    loaded = args.nan_track ? nothing : load_checkpoint(checkpoint_path)
     step_start = 1
     decoder_layers = args.decoder_layers
     cross_layers = args.cross_layers
@@ -404,6 +408,11 @@ function main()
             model = device(model)
         end
         opt = Flux.setup(Muon(eta=args.lr), model)
+    end
+
+    if args.nan_track
+        @info "NaN tracking enabled (no checkpoint load/save)"
+        model = nantrack(model)
     end
 
     # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup: fixed --warmup-steps or fraction (capped).
@@ -545,12 +554,13 @@ function main()
                     @info "step" step_kw...
                 end
             end
-            if step % args.save_every == 0
+            if step % args.save_every == 0 && !args.nan_track
                 save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
-                run_decode_test(model, val_batches, device; full_conversation=val_full)
+                decode_model = args.nan_track ? nanuntrack(model) : model
+                run_decode_test(decode_model, val_batches, device; full_conversation=val_full)
             end
         end
     end
@@ -563,13 +573,14 @@ function main()
     end
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
-    if args.steps >= step_start && args.steps % args.save_every != 0
+    if !args.nan_track && args.steps >= step_start && args.steps % args.save_every != 0
         save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
     end
 
     # Final decode test: single-chunk decode on 3 val batches + full-conversation chunk-by-chunk decode
     @info "Decode test" n_spectrograms=3
-    run_decode_test(model, val_batches, device; full_conversation=val_full)
+    decode_model = args.nan_track ? nanuntrack(model) : model
+    run_decode_test(decode_model, val_batches, device; full_conversation=val_full)
 end
 
 main()

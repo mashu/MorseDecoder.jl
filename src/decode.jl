@@ -168,9 +168,9 @@ function ctc_greedy_decode(
     input_lengths::Vector{Int} = fill(size(spec, 3), size(spec, 2)),
 )
     enc_mem, _ = encode(model, spec)
-    ctc_logits = model.ctc_head(enc_mem)
+    logits = model.ctc_head(enc_mem)
     enc_lengths = div.(input_lengths, ENCODER_DOWNSAMPLE)
-    CTCLoss.ctc_greedy_decode(ctc_logits, enc_lengths; blank = CTC_BLANK_IDX)
+    CTCLoss.ctc_greedy_decode(logits, enc_lengths; blank = CTC_BLANK_IDX)
 end
 
 """

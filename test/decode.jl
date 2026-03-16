@@ -19,7 +19,7 @@
 
     # CTC greedy decode
     enc_mem, _ = encode(model, spec)
-    ctc_logits = model.ctc_head(enc_mem)
-    ctc_ids = ctc_greedy_decode(ctc_logits)
+    logits = model.ctc_head(enc_mem)
+    ctc_ids = ctc_greedy_decode(logits)
     @test size(ctc_ids, 2) == batch
 end

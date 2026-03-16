@@ -74,7 +74,8 @@ add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight) = l
 function add_ctc_loss(loss, model::SpectrogramEncoderDecoder, enc_mem,
                       ctc_targets::Vector{Vector{Int}}, input_lengths::Vector{Int},
                       ctc_weight::Real)
-    loss + ctc_weight * CTCLoss.ctc_loss_batched(model.ctc_head(enc_mem), ctc_targets, input_lengths, CTC_BLANK_IDX)
+    logits = model.ctc_head(enc_mem)
+    loss + ctc_weight * CTCLoss.ctc_loss_batched(logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
 end
 
 # ─── Training step ───────────────────────────────────────────────────────────
