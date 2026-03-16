@@ -24,6 +24,9 @@ using ChainRulesCore
 using UnicodePlots
 using CannotWaitForTheseOptimisers
 using NaNTracker
+# Extend MorseDecoder so nantrack(model) works (encoder dispatches on Dense/Nothing)
+MorseDecoder.apply_encoder_proj(proj::NaNTracker.NaNCheck, h) = MorseDecoder.apply_encoder_proj(proj.layer, h)
+MorseDecoder.project_memory(p::NaNTracker.NaNCheck, x) = MorseDecoder.project_memory(p.layer, x)
 
 # Multi-step gradient accumulation: sum grads over N steps then one optimizer update.
 # Uses ChainRulesCore.add!! for in-place accumulation when possible (AD-agnostic).
@@ -413,6 +416,9 @@ function main()
     if args.nan_track
         @info "NaN tracking enabled (no checkpoint load/save)"
         model = nantrack(model)
+        # Optimiser state must match the tracked model (NaNCheck has path/layer, not σ/weight/bias)
+        opt = Flux.setup(Muon(eta=args.lr), model)
+        args.gpu && (opt = device(opt))
     end
 
     # LR schedule: one-cycle (warmup then cosine decay) or constant. Warmup: fixed --warmup-steps or fraction (capped).
