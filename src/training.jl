@@ -62,12 +62,26 @@ end
 
 # ─── CTC target preparation ──────────────────────────────────────────────────
 
+# Tokens to skip in CTC targets: control tokens + speaker tokens.
+# Speaker tokens [S1]–[S6] have no acoustic correlate (CTC cannot tell which
+# station number is transmitting from the audio alone), so including them wastes
+# label capacity and forces truncation of actual characters.
+# [TS]/[TE] are kept because they correspond to audible silence gaps.
+const CTC_SKIP_TOKENS = Set((
+    START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX, 0,
+    SPEAKER_1_IDX, SPEAKER_2_IDX, SPEAKER_3_IDX,
+    SPEAKER_4_IDX, SPEAKER_5_IDX, SPEAKER_6_IDX,
+))
+
 """
     prepare_ctc_targets(batch::Batch) -> Vector{Vector{Int}}
 
 Extract CTC label sequences from a Batch. CTC is frame-level and sees only the
 current chunk's spectrogram, so prefix tokens are stripped. Only the chunk's own
 tokens (after prefix) are used as CTC targets.
+
+Speaker tokens are excluded (no acoustic correlate for CTC). Transmission
+boundary tokens [TS]/[TE] are kept since they correspond to silence gaps.
 """
 function prepare_ctc_targets(batch::Batch)
     prepare_ctc_targets(batch, div.(batch.input_lengths, ENCODER_DOWNSAMPLE))
@@ -75,14 +89,13 @@ end
 
 function prepare_ctc_targets(batch::Batch, enc_lengths::Vector{Int})
     B = size(batch.targets, 1)
-    skip = Set((START_TOKEN_IDX, PAD_TOKEN_IDX, EOS_TOKEN_IDX, 0))
     ctc_targets = Vector{Vector{Int}}(undef, B)
     for b in 1:B
         # Skip prefix, take only this chunk's tokens
         pfx = batch.prefix_lengths[b]
         tgt_end = batch.target_lengths[b]
         chunk_tgt = @view batch.targets[b, pfx+1:tgt_end]
-        raw = [t for t in chunk_tgt if t ∉ skip]
+        raw = [t for t in chunk_tgt if t ∉ CTC_SKIP_TOKENS]
         T_b = enc_lengths[b]
         L_max = max(0, div(T_b - 1, 2))   # CTC constraint: T >= 2*L+1
         ctc_targets[b] = length(raw) <= L_max ? raw : raw[1:L_max]
@@ -95,12 +108,24 @@ end
 """No CTC targets → return loss unchanged."""
 add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight) = loss
 
-"""CTC targets provided → add weighted CTC loss."""
+"""CTC targets provided → add weighted CTC loss, normalized per-frame.
+
+`CTCLoss.ctc_loss_batched` returns `sum(nll) / B` (per-sample average), which is
+the total negative log-likelihood of each sequence divided by batch size. This can
+be 10–100× larger than the decoder's per-token cross-entropy, causing the CTC
+gradient to dominate the encoder and collapse to blank.
+
+We rescale to per-frame: divide by the average number of encoder frames so the
+CTC contribution is on the same scale as the decoder's per-token loss. This way
+`ctc_weight=0.5` actually means a ~50/50 split rather than CTC dominating."""
 function add_ctc_loss(loss, model::SpectrogramEncoderDecoder, enc_mem,
                       ctc_targets::Vector{Vector{Int}}, input_lengths::Vector{Int},
                       ctc_weight::Real)
     logits = model.ctc_head(enc_mem)
-    loss + ctc_weight * CTCLoss.ctc_loss_batched(logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
+    ctc_raw = CTCLoss.ctc_loss_batched(logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
+    # Rescale from per-sample to per-frame to match decoder per-token CE scale
+    avg_frames = Float32(sum(input_lengths)) / Float32(length(input_lengths))
+    loss + ctc_weight * (ctc_raw / max(avg_frames, 1.0f0))
 end
 
 # ─── Training step ───────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 # ─── Encoder input (what the network sees) ───────────────────────────────────
 
 """
-    plot_encoder_input(spec, sr, cfg; title, colormap) → Figure
+    plot_encoder_input(spec, sr, cfg; title, colormap, chunk_boundaries) → Figure
 
 Plot the **exact** spectrogram the encoder receives: (n_bins × n_frames) in **model scale**
 (peak-normalized, log10). Use this to see the visual representation of the network input.
@@ -13,11 +13,14 @@ Plot the **exact** spectrogram the encoder receives: (n_bins × n_frames) in **m
 - `spec`: (bins × frames) already in model scale (e.g. `sample.spectrogram` from the simulator,
   or `spectrogram_to_model_scale(compute_spectrogram(...))` for real audio). Values are typically ≈ -8 to 0.
 - No extra log is applied; the color scale is the actual input value.
+- `chunk_boundaries`: optional vector of 1-based frame indices where each new chunk starts (after the first).
+  Red vertical lines are drawn at these positions to separate chunks.
 """
 function plot_encoder_input(spec::AbstractMatrix{<:Real}, sr::Int,
                             cfg::SpectrogramConfig;
                             title::String = "Encoder input (model scale)",
-                            colormap = :viridis)
+                            colormap = :viridis,
+                            chunk_boundaries::Union{Nothing, AbstractVector{<:Integer}} = nothing)
     n_bins, n_frames = size(spec)
     times = range(0, step = cfg.hop / sr, length = n_frames)
     freqs = range(cfg.freq_lo, cfg.freq_hi, length = n_bins)
@@ -28,6 +31,12 @@ function plot_encoder_input(spec::AbstractMatrix{<:Real}, sr::Int,
     ax  = Axis(fig[1, 1]; title, xlabel = "Time (s)", ylabel = "Frequency (Hz)")
     hm = heatmap!(ax, collect(times), collect(freqs), z; colormap)
     ylims!(ax, cfg.freq_lo, cfg.freq_hi)
+    if chunk_boundaries !== nothing && !isempty(chunk_boundaries)
+        frame_to_time(f) = (f - 1) * cfg.hop / sr
+        for b in chunk_boundaries
+            1 <= b <= n_frames + 1 && vlines!(ax, [frame_to_time(b)]; color = :red, linewidth = 2)
+        end
+    end
     Colorbar(fig[1, 2], hm; label = "log10 (model input)")
     fig
 end

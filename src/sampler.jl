@@ -37,7 +37,9 @@ struct Sample{TT<:AbstractTokenTiming}
     token_timing::TT
 end
 
-Sample(spec::Matrix{Float32}, ids::Vector{Int}) = Sample(spec, ids, NoTiming())
+Sample(spec::Matrix{Float32}, ids::Vector{Int}) = Sample{NoTiming}(spec, ids, NoTiming())
+Sample(spec::Matrix{Float32}, ids::Vector{Int}, timing::NoTiming) = Sample{NoTiming}(spec, ids, timing)
+Sample(spec::Matrix{Float32}, ids::Vector{Int}, timing::TokenTiming) = Sample{TokenTiming}(spec, ids, timing)
 
 # ─── TrainingChunk (for continuation-aware training) ─────────────────────────
 
@@ -114,6 +116,11 @@ function collate(chunks::AbstractVector{TrainingChunk})
 end
 
 # ─── Chunking: continuation-aware split at [TS]/[TE] boundaries ─────────────
+#
+# [TS] = transmission start (station starts keying), [TE] = transmission end (station unkeys).
+# There are many [TS]/[TE] because each station turn is one [TS]…[TE] segment (S1 talks, then S2, then S1, …).
+# Chunk boundaries: normally between [TE] and the next [TS] (gap/silence). Only when a single
+# transmission is longer than max_frames do we sub-chunk it — then a boundary can cut through the signal.
 
 """
     transmission_segments(token_ids) -> Vector{Tuple{Int,Int}}
@@ -175,6 +182,7 @@ function chunk_conversation(sample::Sample{TokenTiming}, max_frames::Int;
         is_last = seg_idx == length(segs)
 
         if n_frames <= max_frames
+            # One chunk per transmission; boundary falls in the gap after [TE] (before next [TS]) — no cut through signal.
             toks = Int[]
             is_first && push!(toks, START_TOKEN_IDX)
             append!(toks, seg_tokens)
@@ -184,7 +192,8 @@ function chunk_conversation(sample::Sample{TokenTiming}, max_frames::Int;
                                         toks, tail(accumulated, max_prefix)))
             append!(accumulated, toks)
         else
-            # Sub-chunk a long transmission; assign tokens by frame midpoint
+            # Sub-chunk one long transmission (> max_frames): boundaries cut through the signal (middle of one station keying).
+            # Assign tokens to sub-chunks by frame midpoint.
             n_sub = cld(n_frames, max_frames)
             for c in 1:n_sub
                 cf_start = f_start + (c - 1) * max_frames
