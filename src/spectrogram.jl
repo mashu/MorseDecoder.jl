@@ -10,7 +10,7 @@ for Morse (200–800 Hz) using 100–900 Hz keeps freq_bins small and saves memo
 a spectrogram from real audio with `compute_spectrogram` you get **linear power**.
 Call `spectrogram_to_model_scale(spec)` before feeding to the model so the scale
 matches. For full match you also need 40 mel bins in 200–900 Hz (same as
-SamplerConfig / MorseSimulator); otherwise use the same bin count as your model
+MorseSimulator DatasetConfig); otherwise use the same bin count as your model
 was trained with.
 
 - Frequency: sr/nfft Hz per bin. Default nfft=1024 at 8 kHz → ~7.8 Hz.

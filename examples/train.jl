@@ -15,6 +15,7 @@ if "--gpu" in ARGS
     using cuDNN
 end
 using MorseDecoder
+using MorseSimulator: DatasetConfig, DirectPath
 using Flux
 using Optimisers: adjust!
 using ParameterSchedulers: OneCycle
@@ -142,6 +143,9 @@ function parse_commandline()
         help = "Label smoothing for decoder CE (0 = none; 0.1 default to reduce overconfident collapse)"
         arg_type = Float32
         default = Float32(0.1)
+        "--no-qk-norm"
+        help = "Disable QK-norm in attention (ablation; default uses QK-norm)"
+        action = :store_true
     end
     parsed = ArgParse.parse_args(ARGS, s)
     # CPU: default batch 8 if user did not pass --batch (parser default is 64)
@@ -164,14 +168,15 @@ function parse_commandline()
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
       benchmark = parsed["benchmark"], nan_track = parsed["nan-track"],
-      ctc_weight, label_smoothing = parsed["label-smoothing"])
+      ctc_weight, label_smoothing = parsed["label-smoothing"],
+      qk_norm = !parsed["no-qk-norm"])
 end
 
-function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0))
+function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0), qk_norm::Bool=true)
     enc_dim = something(encoder_dim, dim)  # encoder_dim == dim (default) => single shared dim
-    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers)
+    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers; qk_norm)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
-        n_cross_layers=cross_layers, decoder_input_dropout, self_attn_residual_scale)
+        n_cross_layers=cross_layers, decoder_input_dropout, self_attn_residual_scale, qk_norm)
     ctc_head = Dense(enc_dim => CTC_VOCAB_SIZE)
     encoder_proj = (enc_dim == dim) ? nothing : Dense(enc_dim => dim)
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head, encoder_proj)
@@ -232,7 +237,7 @@ token_ids_to_string_with_speakers(ids::AbstractVector{<:Integer}) = token_ids_to
 """Plain text only (no special tokens)."""
 token_ids_to_string(ids::AbstractVector{<:Integer}) = token_ids_to_plain_text(ids)
 
-function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_dim=nothing, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float32=0.0f0, self_attn_residual_scale::Float32=1.0f0, ctc_weight::Float32=0.0f0)
+function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::Int, encoder_dim=nothing, encoder_layers::Int, n_heads::Int, decoder_layers::Int, cross_layers::Int, decoder_input_dropout::Float32=0.0f0, self_attn_residual_scale::Float32=1.0f0, ctc_weight::Float32=0.0f0, qk_norm::Bool=true)
     mkpath(dirname(path))
     model_cpu = cpu(model)  # checkpoint serialization: save CPU state (no device in file)
     model_state = Flux.state(model_cpu)
@@ -240,7 +245,7 @@ function save_checkpoint(path::String, step::Int, n_bins::Int, model, opt; dim::
     # Do not save optimiser_state: Muon (and some other optimisers) contain anonymous functions
     # that JLD2 cannot serialize. On resume we create a fresh optimizer and apply the LR schedule.
     jldsave(path; step, n_bins, dim, encoder_dim=enc_dim_save, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale,
-            ctc_weight, model_state)
+            ctc_weight, qk_norm, model_state)
     @info "checkpoint saved" step=step path=path
 end
 
@@ -264,7 +269,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
 
     # Warmup
     for _ in 1:warmup
-        batch = generate_chunked_batch(cfg, args.batch_size, rng; max_frames=args.max_frames)
+        batch = generate_training_batch(cfg, args.batch_size, args.max_frames; rng)
         spec, decoder_input, decoder_target = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
@@ -293,7 +298,7 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     # Timed run
     for _ in 1:n_steps
         t0 = time()
-        batch = generate_chunked_batch(cfg, args.batch_size, rng; max_frames=args.max_frames)
+        batch = generate_training_batch(cfg, args.batch_size, args.max_frames; rng)
         spec, decoder_input, decoder_target = prepare_training_batch(batch)
         push!(t_data, time() - t0)
 
@@ -362,7 +367,8 @@ function load_checkpoint(path::String)
         decoder_input_dropout = haskey(f, "decoder_input_dropout") ? Float32(f["decoder_input_dropout"]) : nothing
         self_attn_residual_scale = haskey(f, "self_attn_residual_scale") ? Float32(f["self_attn_residual_scale"]) : nothing
         ctc_weight = Float32(haskey(f, "ctc_weight") ? f["ctc_weight"] : 0.0)
-        (; step, n_bins, model_state, optimiser_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, ctc_weight)
+        qk_norm = get(f, "qk_norm", true)  # older checkpoints default to true
+        (; step, n_bins, model_state, optimiser_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, ctc_weight, qk_norm)
     end
 end
 
@@ -373,8 +379,9 @@ function main()
     checkpoint_path = joinpath(args.checkpoint_dir, "checkpoint_latest.jld2")
 
     # Chunked training: full conversations from simulator, split at [TS]/[TE] into chunks ≤ max_frames.
-    cfg = SamplerConfig()
-    batch_src = ChunkedBatchSource(cfg, args.batch_size, args.max_frames; rng=args.prefetch > 0 ? MersenneTwister(rand(rng, UInt)) : rng)
+    cfg = DatasetConfig(; path = DirectPath(), sample_rate = 44100, fft_size = 4096, hop_size = 128,
+        n_mels = 40, f_min = 200.0, f_max = 900.0, stations = 2:4)
+    batch_src = BatchIterator(cfg, args.batch_size, args.max_frames; rng = args.prefetch > 0 ? MersenneTwister(rand(rng, UInt)) : rng)
     first_batch, batch_state = iterate(batch_src)
     n_bins = size(first_batch.spectrogram, 1)
 
@@ -395,7 +402,8 @@ function main()
         cross_layers = something(get(d, :cross_layers, nothing), args.cross_layers)
         decoder_input_dropout = Float32(something(get(d, :decoder_input_dropout, nothing), args.decoder_input_dropout))
         self_attn_residual_scale = Float32(something(get(d, :self_attn_residual_scale, nothing), 1.0f0))
-        model = build_model(d.n_bins; dim, encoder_dim, n_heads, encoder_layers, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
+        qk_norm = something(get(d, :qk_norm, nothing), args.qk_norm)
+        model = build_model(d.n_bins; dim, encoder_dim, n_heads, encoder_layers, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, qk_norm)
         # No try-catch: errors propagate (avoids CUDA memory leaks). Incompatible checkpoint => fix or remove file and rerun.
         Flux.loadmodel!(model, d.model_state)
         step_start = d.step + 1
@@ -406,9 +414,9 @@ function main()
             model = device(model)
             opt = device(opt)
         end
-        @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight
+        @info "Resumed from checkpoint" path=checkpoint_path from_step=d.step continuing_from=step_start dim=dim encoder_dim=encoder_dim encoder_layers=encoder_layers decoder_layers=decoder_layers cross_layers=cross_layers n_heads=n_heads self_attn_residual_scale=self_attn_residual_scale ctc_weight=args.ctc_weight qk_norm=qk_norm
     else
-        model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale)
+        model = build_model(n_bins; dim=args.dim, encoder_dim=args.encoder_dim, n_heads=args.n_heads, encoder_layers=args.encoder_layers, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, qk_norm=args.qk_norm)
         if args.gpu
             model = device(model)
         end
@@ -451,9 +459,9 @@ function main()
     val_batches, val_full = let max_f = args.max_frames
         batches = [let rng = MersenneTwister(s), rng2 = MersenneTwister(s + 1000)
             full_sample = generate_sample(cfg; rng)
-            chunks = segments_to_chunks(full_sample.spectrogram, full_sample.token_ids, max_f, full_sample.token_timing)
+            chunks = chunk_conversation(full_sample, max_f)
             if isempty(chunks)
-                generate_chunked_batch(cfg, 1, MersenneTwister(s); max_frames=max_f)
+                generate_training_batch(cfg, 1, max_f; rng = MersenneTwister(s))
             else
                 idx = rand(rng2, 1:length(chunks))
                 collate([chunks[idx]])
@@ -465,14 +473,14 @@ function main()
     end
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale qk_norm=args.qk_norm n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
         return
     end
 
-    # Prefetched batch producer: single ChunkedBatchSource; first batch already taken for n_bins.
+    # Prefetched batch producer: single BatchIterator; first batch already taken for n_bins.
     batch_channel = nothing
     batch_pending = first_batch
     batch_iter_state = batch_state
@@ -565,7 +573,7 @@ function main()
                 end
             end
             if step % args.save_every == 0 && !args.nan_track
-                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
+                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight, qk_norm=args.qk_norm)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
@@ -584,7 +592,7 @@ function main()
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
     if !args.nan_track && args.steps >= step_start && args.steps % args.save_every != 0
-        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight)
+        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight, qk_norm=args.qk_norm)
     end
 
     # Final decode test: single-chunk decode on 3 val batches + full-conversation chunk-by-chunk decode

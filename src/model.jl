@@ -82,10 +82,11 @@ function SpectrogramEncoder(
     ff_mult::Int = 4,
     norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 4096,
+    qk_norm::Bool = true,
 )
     frontend = CWFeatureExtractor(n_freq_bins; d_model=CW_FRONTEND_DIM)
     proj = dim == CW_FRONTEND_DIM ? nothing : Dense(CW_FRONTEND_DIM => dim)
-    blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm=true) for _ in 1:n_layers]
+    blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm) for _ in 1:n_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     rope = RoPE(dim ÷ n_heads, max_len)
     SpectrogramEncoder(frontend, proj, blocks, norm, rope)
@@ -151,14 +152,15 @@ function SpectrogramDecoder(
     ff_mult::Int = 4,
     norm_eps::AbstractFloat = 1f-5,
     max_len::Int = 2048,
+    qk_norm::Bool = true,
 )
     n_cross_layers >= n_decoder_layers || throw(ArgumentError("n_cross_layers ($n_cross_layers) must be >= n_decoder_layers ($n_decoder_layers)"))
     (n_decoder_layers > 0 || n_cross_layers >= 1) || throw(ArgumentError("when n_decoder_layers=0, n_cross_layers must be >= 1"))
     embed = Flux.Embedding(vocab_size => dim)
     embed_dropout = Flux.Dropout(decoder_input_dropout)
-    # QK-norm (Llama 3–style) in both self- and cross-attention keeps attention logits in a safe range
-    self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm=true) for _ in 1:n_decoder_layers]
-    cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm=true) for _ in 1:n_cross_layers]
+    # QK-norm (Llama 3–style) in both self- and cross-attention keeps attention logits in a safe range; disable with qk_norm=false to ablate
+    self_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm) for _ in 1:n_decoder_layers]
+    cross_blocks = [TransformerBlock(dim, n_heads, n_kv_heads, dim * ff_mult; norm_eps, qk_norm) for _ in 1:n_cross_layers]
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)

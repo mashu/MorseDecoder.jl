@@ -1,7 +1,7 @@
 name = "MorseDecoder"
 uuid = "77dfe640-0c06-49f1-b491-a76fd0fcbc60"
-authors = ["Mateusz Kaduk <mateusz.kaduk@gmail.com>"]
 version = "0.2.0"
+authors = ["Mateusz Kaduk <mateusz.kaduk@gmail.com>"]
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
@@ -25,6 +25,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SampledSignals = "bd7594eb-a658-542f-9e75-4c4d8908c167"
 UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
@@ -43,6 +44,7 @@ ParameterSchedulers = "0.4.3"
 PortAudio = "1.3"
 SampledSignals = "2.1"
 UnicodePlots = "3.8.1"
+Zygote = "0.7.10"
 cuDNN = "1.4.6"
 
 [extras]

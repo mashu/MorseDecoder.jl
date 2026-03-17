@@ -54,15 +54,16 @@ function load_checkpoint(path::String)
         cross_layers = haskey(f, "cross_layers") ? f["cross_layers"] : 2
         decoder_input_dropout = haskey(f, "decoder_input_dropout") ? Float32(f["decoder_input_dropout"]) : 0.1f0
         self_attn_residual_scale = haskey(f, "self_attn_residual_scale") ? Float32(f["self_attn_residual_scale"]) : 1.0f0
-        (; step, n_bins, model_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale)
+        qk_norm = get(f, "qk_norm", true)
+        (; step, n_bins, model_state, dim, encoder_dim, encoder_layers, n_heads, decoder_layers, cross_layers, decoder_input_dropout, self_attn_residual_scale, qk_norm)
     end
 end
 
-function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0))
+function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encoder_layers=6, decoder_layers=2, cross_layers=2, decoder_input_dropout=Float32(0.1), self_attn_residual_scale=Float32(1.0), qk_norm::Bool=true)
     enc_dim = something(encoder_dim, dim)
-    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers)
+    encoder = SpectrogramEncoder(n_bins, enc_dim, n_heads, encoder_layers; qk_norm)
     decoder = SpectrogramDecoder(VOCAB_SIZE, dim, n_heads, decoder_layers;
-        n_cross_layers=cross_layers, decoder_input_dropout, self_attn_residual_scale)
+        n_cross_layers=cross_layers, decoder_input_dropout, self_attn_residual_scale, qk_norm)
     ctc_head = Dense(enc_dim => CTC_VOCAB_SIZE)
     encoder_proj = (enc_dim == dim) ? nothing : Dense(enc_dim => dim)
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head, encoder_proj)
@@ -80,7 +81,7 @@ function main()
     end
     model = build_model(d.n_bins; dim=d.dim, encoder_dim=d.encoder_dim, n_heads=d.n_heads,
         encoder_layers=d.encoder_layers, decoder_layers=d.decoder_layers, cross_layers=d.cross_layers,
-        decoder_input_dropout=d.decoder_input_dropout, self_attn_residual_scale=d.self_attn_residual_scale)
+        decoder_input_dropout=d.decoder_input_dropout, self_attn_residual_scale=d.self_attn_residual_scale, qk_norm=d.qk_norm)
     Flux.loadmodel!(model, d.model_state)
     model = device(model)
     @info "Model loaded" checkpoint=args["checkpoint"] step=d.step n_bins=d.n_bins

@@ -9,19 +9,19 @@ Labels use simulator tokens: <START>, <END>, [S1]..[S6], [TS], [TE].
 # Quick start
 
 ```julia
-using MorseDecoder, Random
+using MorseDecoder, MorseSimulator, Random
 
+cfg = DatasetConfig(; path = DirectPath(), sample_rate = 44100, fft_size = 4096, hop_size = 128,
+    n_mels = 40, f_min = 200.0, f_max = 900.0, stations = 2:4)   # 200–900 Hz, ~10 Hz resolution
 rng = MersenneTwister(42)
-cfg = SamplerConfig()   # 200–900 Hz, ~10 Hz resolution
-s   = generate_sample(cfg; rng)   # one full conversation
-batch = generate_chunked_batch(cfg, 32, rng; max_frames=512)   # one batch of chunks
+s = generate_sample(cfg; rng)   # one full conversation
+batch = generate_training_batch(cfg, 32, 512; rng)   # one batch of chunks
 ```
 
 # Chunked training and decoding
 
-- **ChunkedConversation(spec, token_ids, max_frames)** — iterable over `Sample` chunks of one conversation (split at [TS]/[TE]).
-- **ChunkedSampleSource(cfg, max_frames; rng)** — infinite iterator of chunked samples.
-- **ChunkedBatchSource(cfg, batch_size, max_frames; rng)** — infinite iterator of `Batch` for training.
+- **ChunkedConversation(sample, max_frames)** — iterable over `Sample` chunks of one conversation (split at [TS]/[TE]).
+- **BatchIterator(cfg, batch_size, max_frames; rng)** — infinite iterator of `Batch` for training.
 - **decode_conversation(model, chunks, to_device; ...)** — decode a full conversation from an iterable of spectrogram chunks (chunk-by-chunk with continuation; supports streaming).
 """
 module MorseDecoder
@@ -64,10 +64,10 @@ export
     spectrogram_to_model_scale,
 
     # Sampler (MorseSimulator)
-    Sample, SamplerConfig, generate_sample,
-    Batch, collate, generate_batch,
-    transmission_segments, segments_to_chunks, chunked_samples, generate_chunked_batch,
-    ChunkedConversation, ChunkedSampleSource, ChunkedBatchSource,
+    Sample, generate_sample,
+    Batch, collate,
+    transmission_segments, chunk_conversation, generate_training_batch,
+    ChunkedConversation, BatchIterator,
 
     # Visualization
     plot_spectrogram, plot_chunk,
