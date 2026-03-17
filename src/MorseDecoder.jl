@@ -20,8 +20,10 @@ batch = generate_training_batch(cfg, 32, 512; rng)   # one batch of chunks
 
 # Chunked training and decoding
 
-- **ChunkedConversation(sample, max_frames)** — iterable over `Sample` chunks of one conversation (split at [TS]/[TE]).
-- **BatchIterator(cfg, batch_size, max_frames; rng)** — infinite iterator of `Batch` for training.
+- **TrainingChunk** — one chunk of a conversation (spectrogram + token_ids + prefix for continuation).
+- **chunk_conversation(sample, max_frames)** — split a conversation into `TrainingChunk`s (for batching via collate).
+- **ChunkedConversation(sample, max_frames)** — iterable over spectrogram chunks (`Matrix{Float32}`) for decode_conversation (split at [TS]/[TE]).
+- **BatchIterator(cfg, batch_size, max_frames; rng)** — infinite iterator of `Batch` for training (generate_training_batch under the hood).
 - **decode_conversation(model, chunks, to_device; ...)** — decode a full conversation from an iterable of spectrogram chunks (chunk-by-chunk with continuation; supports streaming).
 """
 module MorseDecoder
@@ -65,7 +67,7 @@ export
 
     # Sampler (MorseSimulator)
     Sample, generate_sample,
-    Batch, collate,
+    TrainingChunk, Batch, collate,
     transmission_segments, chunk_conversation, generate_training_batch,
     ChunkedConversation, BatchIterator,
 

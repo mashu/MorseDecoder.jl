@@ -270,12 +270,13 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     # Warmup
     for _ in 1:warmup
         batch = generate_training_batch(cfg, args.batch_size, args.max_frames; rng)
-        spec, decoder_input, decoder_target = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target, loss_mask = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
+        loss_mask = device(loss_mask)
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, loss_mask) / args.accum_steps
         end
         if grads_accum === nothing
             grads_accum = result.grad[1]
@@ -299,18 +300,19 @@ function run_benchmark(args, model, opt, cfg, device, n_bins)
     for _ in 1:n_steps
         t0 = time()
         batch = generate_training_batch(cfg, args.batch_size, args.max_frames; rng)
-        spec, decoder_input, decoder_target = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target, loss_mask = prepare_training_batch(batch)
         push!(t_data, time() - t0)
 
         t0 = time()
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
+        loss_mask = device(loss_mask)
         push!(t_transfer, time() - t0)
 
         t0 = time()
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, loss_mask) / args.accum_steps
         end
         push!(t_fwbw, time() - t0)
 
@@ -529,10 +531,11 @@ function main()
                 batch, batch_iter_state = it
             end
         end
-        spec, decoder_input, decoder_target = prepare_training_batch(batch)
+        spec, decoder_input, decoder_target, loss_mask = prepare_training_batch(batch)
         spec = device(spec)
         decoder_input = device(decoder_input)
         decoder_target = device(decoder_target)
+        loss_mask = device(loss_mask)
 
         ctc_kws = if args.ctc_weight > 0
             enc_len = div.(batch.input_lengths, MorseDecoder.ENCODER_DOWNSAMPLE)
@@ -542,7 +545,7 @@ function main()
         end
 
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target; ctc_kws..., label_smoothing=args.label_smoothing) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, loss_mask; ctc_kws..., label_smoothing=args.label_smoothing) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 

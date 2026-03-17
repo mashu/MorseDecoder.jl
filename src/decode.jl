@@ -150,10 +150,6 @@ function decode_conversation(
     tokens
 end
 
-# Accept ChunkedConversation (yields Sample); forward to spectrogram iterable.
-decode_conversation(model::SpectrogramEncoderDecoder, chunks::ChunkedConversation, to_device = identity; kws...) =
-    decode_conversation(model, (s.spectrogram for s in chunks), to_device; kws...)
-
 # ─── CTC greedy decode ───────────────────────────────────────────────────────
 
 """
