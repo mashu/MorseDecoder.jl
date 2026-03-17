@@ -74,7 +74,7 @@ export
     ChunkedConversation, BatchIterator,
 
     # Visualization
-    plot_spectrogram, plot_chunk,
+    plot_spectrogram, plot_encoder_input, plot_chunk,
 
     # Model architecture
     SpectrogramEncoder, SpectrogramDecoder, SpectrogramEncoderDecoder,

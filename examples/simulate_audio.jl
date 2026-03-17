@@ -7,7 +7,7 @@
 # Output (default prefix "band"):
 #   band.wav             — mixed audio (44.1 kHz)
 #   band_transcript.txt  — training label (flat_text format)
-#   band.png             — spectrogram (200–900 Hz, linear band)
+#   band.png             — encoder input view (200–900 Hz, model scale)
 
 using MorseDecoder
 using MorseSimulator: DatasetConfig, DirectPath, generate_sample_with_audio, save_audio
@@ -42,9 +42,9 @@ function main()
     end
     println("Wrote transcript: $txtpath")
 
-    # Spectrogram plot (200–900 Hz linear band; cfg for axis labels)
+    # Encoder input: exactly what the network sees (log10 model scale)
     spec_cfg = SpectrogramConfig(; nfft=4096, hop=128, freq_lo=200f0, freq_hi=900f0)
-    fig = plot_spectrogram(Float32.(sample.spectrogram), config.sample_rate, spec_cfg; title="Linear band 200–900 Hz")
+    fig = plot_encoder_input(Float32.(sample.spectrogram), config.sample_rate, spec_cfg; title="Encoder input (200–900 Hz)")
     pngpath = "$prefix.png"
     save(pngpath, fig)
     println("Wrote spectrogram: $pngpath")
