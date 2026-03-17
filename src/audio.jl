@@ -6,27 +6,24 @@ Uses PortAudio for capture and yields spectrogram chunks compatible with
 simulator chunks to mic (or file) by passing a different chunk iterable.
 
 **Dependencies:** PortAudio, SampledSignals (for stream read API).
-**Match training:** Use the same sample rate as training (e.g. 44100) and a
-spectrogram config that yields the same n_bins (e.g. 40). See `mic_spectrogram_config`.
+**Match training:** Use the same sample rate and band (200–900 Hz, nfft=4096)
+so n_bins matches the model. See `mic_spectrogram_config`.
 """
 
 using PortAudio
 using SampledSignals: read, samplerate
 
-# ─── Spectrogram config that matches typical model (40 bins, 200–620 Hz at 44.1 kHz) ───
-# Training uses 40 mel bins in 200–900 Hz. Linear FFT with nfft=4096 at 44100 Hz has
-# ~10.77 Hz/bin; 40 bins over 200–620 Hz gives 40 bins. Same hop as training (128).
+# ─── Spectrogram config matching training (linear band 200–900 Hz, ~66 bins) ───
 const DEFAULT_MIC_HOP = 128
 const DEFAULT_MIC_NFFT = 4096
 
 """
     mic_spectrogram_config(sample_rate; n_bins, hop, nfft)
 
-SpectrogramConfig for real-time mic input that yields `n_bins` (default 40) in the
-CW band, to match a model trained with 40 mel bins. At 44100 Hz with nfft=4096,
-freq_hi is set so that the linear band has 40 bins; use the same sample_rate as training.
+SpectrogramConfig for real-time mic input. Default n_bins matches training
+(linear band 200–900 Hz at 44.1 kHz, 4096 FFT → 66 bins). Same hop as training (128).
 """
-function mic_spectrogram_config(sample_rate::Int; n_bins::Int = 40, hop::Int = DEFAULT_MIC_HOP, nfft::Int = DEFAULT_MIC_NFFT)
+function mic_spectrogram_config(sample_rate::Int; n_bins::Int = 66, hop::Int = DEFAULT_MIC_HOP, nfft::Int = DEFAULT_MIC_NFFT)
     freq_lo = 200f0
     bin_width_hz = Float32(sample_rate / nfft)
     freq_hi = freq_lo + (n_bins - 1) * bin_width_hz

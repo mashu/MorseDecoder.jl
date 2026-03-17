@@ -382,7 +382,7 @@ function main()
 
     # Chunked training: full conversations from simulator, split at [TS]/[TE] into chunks ≤ max_frames.
     cfg = DatasetConfig(; path = DirectPath(), sample_rate = 44100, fft_size = 4096, hop_size = 128,
-        n_mels = 40, f_min = 200.0, f_max = 900.0, stations = 2:4)
+        f_min = 200.0, f_max = 900.0, stations = 2:4)
     batch_src = BatchIterator(cfg, args.batch_size, args.max_frames; rng = args.prefetch > 0 ? MersenneTwister(rand(rng, UInt)) : rng)
     first_batch, batch_state = iterate(batch_src)
     n_bins = size(first_batch.spectrogram, 1)

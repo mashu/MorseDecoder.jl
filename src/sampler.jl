@@ -63,7 +63,7 @@ One full conversation from MorseSimulator (spectrogram + token_ids).
 """
 function generate_sample(cfg::DatasetConfig; rng::AbstractRNG = Random.default_rng())
     ds = sim_generate_sample(rng, cfg)
-    Sample(Float32.(ds.mel_spectrogram), label_to_token_ids(ds.label), ds.token_timing)
+    Sample(Float32.(ds.spectrogram), label_to_token_ids(ds.label), ds.token_timing)
 end
 
 # ─── Batch ───────────────────────────────────────────────────────────────────

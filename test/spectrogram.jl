@@ -1,11 +1,11 @@
 @testset "spectrogram" begin
     cfg = SpectrogramConfig()
-    @test cfg.nfft == 1024
-    @test cfg.hop == 64
+    @test cfg.nfft == 4096
+    @test cfg.hop == 128
     @test cfg.freq_lo == 200f0
-    @test cfg.freq_hi == 800f0
+    @test cfg.freq_hi == 900f0
 
-    sr = 8000
+    sr = 44100
     @test num_bins(cfg, sr) > 0
     @test num_frames(cfg, 16000) >= 1
 

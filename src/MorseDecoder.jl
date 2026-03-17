@@ -2,8 +2,10 @@
     MorseDecoder
 
 Training pipeline for a spectrogram encoder–decoder that decodes multi-station
-CW Morse. Uses MorseSimulator.jl for data: 200–900 Hz mel spectrograms with
-~10 Hz resolution (to separate signals) and time resolution suitable for 50 WPM.
+CW Morse. Uses MorseSimulator.jl for data: 200–900 Hz linear band spectrograms
+(~10 Hz or better resolution, no mel). Time resolution is set by hop_size/sample_rate:
+keep hop_size=128 @ 44.1 kHz (~2.9 ms/frame) so at 50 WPM (dot ≈ 24 ms) you get
+~8 spectrogram frames per dot → ~4 encoder frames after 2× frontend downsample.
 Labels use simulator tokens: <START>, <END>, [S1]..[S6], [TS], [TE].
 
 # Quick start
@@ -12,7 +14,7 @@ Labels use simulator tokens: <START>, <END>, [S1]..[S6], [TS], [TE].
 using MorseDecoder, MorseSimulator, Random
 
 cfg = DatasetConfig(; path = DirectPath(), sample_rate = 44100, fft_size = 4096, hop_size = 128,
-    n_mels = 40, f_min = 200.0, f_max = 900.0, stations = 2:4)   # 200–900 Hz, ~10 Hz resolution
+    f_min = 200.0, f_max = 900.0, stations = 2:4)   # 200–900 Hz linear band, ~10 Hz/bin
 rng = MersenneTwister(42)
 s = generate_sample(cfg; rng)   # one full conversation
 batch = generate_training_batch(cfg, 32, 512; rng)   # one batch of chunks

@@ -2,18 +2,16 @@
     spectrogram.jl — Short-time FFT → power spectrogram in a frequency band.
 
 Produces a (freq_bins × time_frames) matrix: one column per hop, only the
-bins in [freq_lo, freq_hi] Hz.  We never feed the full FFT (e.g. 257 bins);
-for Morse (200–800 Hz) using 100–900 Hz keeps freq_bins small and saves memory.
+bins in [freq_lo, freq_hi] Hz (linear band, no mel). Training uses the same
+linear band from MorseSimulator (~10 Hz resolution at 4096 FFT, 44.1 kHz).
 
-**Training vs real audio:** Training data from MorseSimulator is **mel** spectrogram,
-**peak-normalized** then **log10**. The encoder expects that scale. When you compute
-a spectrogram from real audio with `compute_spectrogram` you get **linear power**.
-Call `spectrogram_to_model_scale(spec)` before feeding to the model so the scale
-matches. For full match you also need 40 mel bins in 200–900 Hz (same as
-MorseSimulator DatasetConfig); otherwise use the same bin count as your model
-was trained with.
+**Training vs real audio:** Training data from MorseSimulator is linear band
+power, peak-normalized then log10. When you compute a spectrogram from real
+audio with `compute_spectrogram` you get linear power; call
+`spectrogram_to_model_scale(spec)` so the scale matches. Use the same nfft,
+freq_lo, freq_hi (and thus n_bins) as training.
 
-- Frequency: sr/nfft Hz per bin. Default nfft=1024 at 8 kHz → ~7.8 Hz.
+- Frequency: sr/nfft Hz per bin (e.g. 4096 @ 44.1 kHz → ~10.77 Hz).
 - Time: one frame every hop/sr seconds.
 """
 
@@ -28,8 +26,8 @@ struct SpectrogramConfig
     freq_hi::Float32
 end
 
-# nfft=1024 → ~7.8 Hz; hop=64 → 8 ms/frame, ~3 frames/dit at 50 WPM for reliable dit/dash
-SpectrogramConfig(; nfft=1024, hop=64, freq_lo=200f0, freq_hi=800f0) =
+# Match MorseSimulator default: 4096 FFT, 200–900 Hz → ~66 bins, ~10 Hz resolution
+SpectrogramConfig(; nfft=4096, hop=128, freq_lo=200f0, freq_hi=900f0) =
     SpectrogramConfig(nfft, hop, freq_lo, freq_hi)
 
 """Number of frequency bins in the configured band for sample rate `sr`."""

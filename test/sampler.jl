@@ -1,8 +1,9 @@
+using Random
 using MorseSimulator: DatasetConfig, DirectPath
 
 function sampler_config()
     DatasetConfig(; path = DirectPath(), sample_rate = 44100, fft_size = 4096, hop_size = 128,
-        n_mels = 40, f_min = 200.0, f_max = 900.0, stations = 2:4)
+        f_min = 200.0, f_max = 900.0, stations = 2:4)
 end
 
 @testset "sampler" begin
