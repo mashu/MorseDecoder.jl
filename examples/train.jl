@@ -136,9 +136,32 @@ function parse_commandline()
         help = "Wrap model with NaNTracker to find where NaN appears in forward/backward (debug only; no checkpoint load/save)"
         action = :store_true
         "--ctc-weight"
-        help = "Weight for CTC loss (0 = no CTC). Light nudge (e.g. 0.05–0.1) keeps attention dominant; default 0.1"
+        help = "Weight for CTC loss (0 = no CTC). Used as constant when --ctc-schedule constant; else target in phase 2 when curriculum."
         arg_type = Float32
         default = Float32(0.1)
+        "--ctc-schedule"
+        help = "constant = use --ctc-weight as-is. curriculum = high CTC + low decoder in phase 1, then transition to low CTC + full decoder."
+        arg_type = String
+        default = "constant"
+        "--ctc-phase1-fraction"
+        help = "Fraction of total steps for phase 1 (high CTC, low decoder) when --ctc-schedule curriculum"
+        arg_type = Float64
+        default = 0.3
+        "--ctc-transition-fraction"
+        help = "Fraction of total steps for linear transition between phase 1 and 2"
+        arg_type = Float64
+        default = 0.1
+        "--ctc-high"
+        help = "CTC weight during phase 1 (curriculum)"
+        arg_type = Float32
+        default = Float32(0.8)
+        "--decoder-scale-phase1"
+        help = "Decoder CE scale during phase 1 (curriculum); 1.0 in phase 2"
+        arg_type = Float32
+        default = Float32(0.3)
+        "--loss-balance"
+        help = "Calibrate CTC vs decoder scale once so ctc_weight/decoder_scale are interpretable (recommended with curriculum)"
+        action = :store_true
         "--label-smoothing"
         help = "Label smoothing for decoder CE (0 = none; 0.1 default to reduce overconfident collapse)"
         arg_type = Float32
@@ -155,6 +178,7 @@ function parse_commandline()
     cross_layers_raw = parsed["cross-layers"]
     cross_layers = (cross_layers_raw == 0 ? (decoder_layers == 0 ? 2 : decoder_layers) : max(decoder_layers, cross_layers_raw))
     ctc_weight = parsed["ctc-weight"]
+    ctc_schedule = parsed["ctc-schedule"]
     encoder_dim_raw = parsed["encoder-dim"]
     encoder_dim = encoder_dim_raw <= 0 ? nothing : encoder_dim_raw  # 0 => use dim for both
     (; gpu = parsed["gpu"], steps = parsed["steps"], batch_size,
@@ -168,7 +192,13 @@ function parse_commandline()
       decoder_input_dropout = parsed["decoder-input-dropout"],
       self_attn_residual_scale = parsed["self-attn-residual-scale"],
       benchmark = parsed["benchmark"], nan_track = parsed["nan-track"],
-      ctc_weight, label_smoothing = parsed["label-smoothing"],
+      ctc_weight, ctc_schedule,
+      ctc_phase1_fraction = parsed["ctc-phase1-fraction"],
+      ctc_transition_fraction = parsed["ctc-transition-fraction"],
+      ctc_high = parsed["ctc-high"],
+      decoder_scale_phase1 = parsed["decoder-scale-phase1"],
+      loss_balance_flag = parsed["loss-balance"],
+      label_smoothing = parsed["label-smoothing"],
       qk_norm = !parsed["no-qk-norm"])
 end
 
@@ -180,6 +210,34 @@ function build_model(n_bins::Int; dim=384, encoder_dim=nothing, n_heads=6, encod
     ctc_head = Dense(enc_dim => CTC_VOCAB_SIZE)
     encoder_proj = (enc_dim == dim) ? nothing : Dense(enc_dim => dim)
     SpectrogramEncoderDecoder(encoder, decoder, ctc_head, encoder_proj)
+end
+
+"""
+Curriculum schedule: phase 1 = high CTC + low decoder scale; transition = linear;
+phase 2 = low CTC (ctc_low) + decoder scale 1.0.
+Returns (ctc_weight::Float32, decoder_scale::Float32) for the given step.
+"""
+function curriculum_schedule(
+    step::Int,
+    total_steps::Int;
+    phase1_fraction::Real,
+    transition_fraction::Real,
+    ctc_high::Float32,
+    ctc_low::Float32,
+    decoder_scale_phase1::Float32,
+)
+    phase1_end = total_steps * phase1_fraction
+    transition_end = phase1_end + total_steps * transition_fraction
+    if step <= phase1_end
+        return (ctc_high, decoder_scale_phase1)
+    elseif step >= transition_end
+        return (ctc_low, 1.0f0)
+    else
+        t = Float32((step - phase1_end) / max(transition_end - phase1_end, 1))
+        ctc_w = ctc_high + t * (ctc_low - ctc_high)
+        dec_s = decoder_scale_phase1 + t * (1.0f0 - decoder_scale_phase1)
+        return (ctc_w, dec_s)
+    end
 end
 
 """Run decode on one spectrogram (single stream with speaker tokens); print truth vs decoded."""
@@ -456,6 +514,35 @@ function main()
         println(plt)
     end
 
+    # Plot CTC/decoder curriculum schedule when enabled
+    use_curriculum = (args.ctc_schedule == "curriculum")
+    if use_curriculum && steps_remaining > 0
+        n_sample = min(400, steps_remaining)
+        steps_sample = round.(Int, range(step_start, args.steps; length=n_sample))
+        ctc_vals = Float64[]
+        dec_vals = Float64[]
+        for s in steps_sample
+            cw, ds = curriculum_schedule(s, args.steps;
+                phase1_fraction=args.ctc_phase1_fraction,
+                transition_fraction=args.ctc_transition_fraction,
+                ctc_high=args.ctc_high,
+                ctc_low=args.ctc_weight,
+                decoder_scale_phase1=args.decoder_scale_phase1,
+            )
+            push!(ctc_vals, cw)
+            push!(dec_vals, ds)
+        end
+        plt_cur = lineplot(steps_sample, [ctc_vals dec_vals];
+            title="Curriculum: CTC weight & decoder scale",
+            xlabel="step",
+            ylabel="weight",
+            name=["ctc_weight", "decoder_scale"],
+            width=60,
+            height=15,
+        )
+        println(plt_cur)
+    end
+
     effective_batch = args.batch_size * args.accum_steps
     # Validation: one random chunk per full conversation (fixed seeds); plus one full conversation for chunk-by-chunk decode
     val_batches, val_full = let max_f = args.max_frames
@@ -475,7 +562,7 @@ function main()
     end
 
     n_params = count_parameters(model)
-    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale qk_norm=args.qk_norm n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight label_smoothing=args.label_smoothing
+    @info "Training" steps=args.steps device=(args.gpu ? "GPU" : "CPU") batch=args.batch_size max_frames=args.max_frames accum=args.accum_steps effective_batch=effective_batch dim=args.dim encoder_dim=args.encoder_dim encoder_layers=args.encoder_layers decoder_layers=args.decoder_layers cross_layers=args.cross_layers n_heads=args.n_heads decoder_input_dropout=args.decoder_input_dropout self_attn_residual_scale=args.self_attn_residual_scale qk_norm=args.qk_norm n_params=n_params lr=args.lr warmup_steps=warmup_steps warmup_fraction=args.warmup_fraction save_every=args.save_every prefetch=args.prefetch prefetch_threads=Threads.nthreads() decode_every=args.decode_every ctc_weight=args.ctc_weight ctc_schedule=args.ctc_schedule label_smoothing=args.label_smoothing
 
     if args.benchmark > 0
         run_benchmark(args, model, opt, cfg, device, n_bins)
@@ -518,6 +605,23 @@ function main()
     accum_count = 0
     loss_sum = 0.0f0
 
+    # Optional one-time calibration so CTC and decoder loss have comparable magnitude
+    loss_balance_scale_val = 1.0f0
+    if args.loss_balance_flag && (use_curriculum || args.ctc_weight > 0)
+        spec_cal, dec_in_cal, dec_tgt_cal, loss_mask_cal = prepare_training_batch(first_batch)
+        spec_cal = device(spec_cal)
+        dec_in_cal = device(dec_in_cal)
+        dec_tgt_cal = device(dec_tgt_cal)
+        loss_mask_cal = device(loss_mask_cal)
+        enc_len_cal = div.(first_batch.input_lengths, MorseDecoder.ENCODER_DOWNSAMPLE)
+        ctc_tgt_cal = prepare_ctc_targets(first_batch, enc_len_cal)
+        loss_balance_scale_val = Float32(Flux.cpu(MorseDecoder.loss_balance_scale(
+            model, spec_cal, dec_in_cal, dec_tgt_cal, loss_mask_cal,
+            ctc_tgt_cal, enc_len_cal; label_smoothing=args.label_smoothing,
+        )))
+        @info "Loss balance" scale=loss_balance_scale_val hint="CTC term is scaled by this so ctc_weight/decoder_scale are interpretable"
+    end
+
     for step in step_start:args.steps
         args.nan_track && NaNTracker.clear_stats!()  # so NaN dump shows only this step's trajectory (which layer exploded)
         if args.prefetch > 0
@@ -537,15 +641,27 @@ function main()
         decoder_target = device(decoder_target)
         loss_mask = device(loss_mask)
 
-        ctc_kws = if args.ctc_weight > 0
+        step_ctc_weight, step_decoder_scale = if use_curriculum
+            curriculum_schedule(step, args.steps;
+                phase1_fraction=args.ctc_phase1_fraction,
+                transition_fraction=args.ctc_transition_fraction,
+                ctc_high=args.ctc_high,
+                ctc_low=args.ctc_weight,
+                decoder_scale_phase1=args.decoder_scale_phase1,
+            )
+        else
+            (args.ctc_weight, 1.0f0)
+        end
+
+        ctc_kws = if step_ctc_weight > 0
             enc_len = div.(batch.input_lengths, MorseDecoder.ENCODER_DOWNSAMPLE)
-            (; ctc_targets=prepare_ctc_targets(batch), input_lengths=enc_len, ctc_weight=args.ctc_weight)
+            (; ctc_targets=prepare_ctc_targets(batch), input_lengths=enc_len, ctc_weight=step_ctc_weight)
         else
             (; ctc_weight=0.0f0)
         end
 
         result = Flux.withgradient(model) do m
-            train_step(m, spec, decoder_input, decoder_target, loss_mask; ctc_kws..., label_smoothing=args.label_smoothing) / args.accum_steps
+            train_step(m, spec, decoder_input, decoder_target, loss_mask; ctc_kws..., decoder_scale=step_decoder_scale, label_smoothing=args.label_smoothing, loss_balance=loss_balance_scale_val) / args.accum_steps
         end
         loss_sum += result.val * args.accum_steps
 
@@ -576,7 +692,8 @@ function main()
                 end
             end
             if step % args.save_every == 0 && !args.nan_track
-                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight, qk_norm=args.qk_norm)
+                save_ctc = use_curriculum ? step_ctc_weight : args.ctc_weight
+                save_checkpoint(checkpoint_path, step, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=save_ctc, qk_norm=args.qk_norm)
             end
             if args.decode_every > 0 && step % args.decode_every == 0
                 @info "decode" step=step n_samples=3
@@ -595,7 +712,8 @@ function main()
 
     # Save final checkpoint if we didn't already save at the last step (e.g. steps=60, save_every=30 → already saved at 60)
     if !args.nan_track && args.steps >= step_start && args.steps % args.save_every != 0
-        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=args.ctc_weight, qk_norm=args.qk_norm)
+        final_ctc = use_curriculum ? curriculum_schedule(args.steps, args.steps; phase1_fraction=args.ctc_phase1_fraction, transition_fraction=args.ctc_transition_fraction, ctc_high=args.ctc_high, ctc_low=args.ctc_weight, decoder_scale_phase1=args.decoder_scale_phase1)[1] : args.ctc_weight
+        save_checkpoint(checkpoint_path, args.steps, n_bins, model, opt; dim=args.dim, encoder_dim=args.encoder_dim, encoder_layers=args.encoder_layers, n_heads=args.n_heads, decoder_layers=args.decoder_layers, cross_layers=args.cross_layers, decoder_input_dropout=args.decoder_input_dropout, self_attn_residual_scale=args.self_attn_residual_scale, ctc_weight=final_ctc, qk_norm=args.qk_norm)
     end
 
     # Final decode test: single-chunk decode on 3 val batches + full-conversation chunk-by-chunk decode

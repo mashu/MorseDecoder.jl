@@ -106,7 +106,35 @@ end
 # ─── CTC loss addition (dispatch: nothing = skip, Vector = compute) ──────────
 
 """No CTC targets → return loss unchanged."""
-add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight) = loss
+add_ctc_loss(loss, _model, _enc_mem, ::Nothing, _input_lengths, _ctc_weight; loss_balance::Real = 1.0) = loss
+
+"""
+    loss_balance_scale(model, spec, decoder_input, decoder_target, loss_mask, ctc_targets, input_lengths; label_smoothing)
+
+One forward (no gradients) to compute decoder_loss and ctc_per_frame; returns
+decoder_loss / max(ctc_per_frame, 1e-8) so that scaling the CTC term by this
+value makes the two losses have equal magnitude. Use for interpretable
+ctc_weight / decoder_scale (e.g. in curriculum).
+"""
+function loss_balance_scale(
+    model::SpectrogramEncoderDecoder,
+    spec,
+    decoder_input,
+    decoder_target,
+    loss_mask,
+    ctc_targets::Vector{Vector{Int}},
+    input_lengths::Vector{Int};
+    label_smoothing::AbstractFloat = 0.0f0,
+)
+    enc_mem, dec_mem = encode(model, spec)
+    logits = model.decoder(decoder_input, dec_mem)
+    dec = sequence_cross_entropy(logits, decoder_target, loss_mask; label_smoothing)
+    logits_ctc = model.ctc_head(enc_mem)
+    ctc_raw = CTCLoss.ctc_loss_batched(logits_ctc, ctc_targets, input_lengths, CTC_BLANK_IDX)
+    avg_frames = Float32(sum(input_lengths)) / Float32(length(input_lengths))
+    ctc_pf = ctc_raw / max(avg_frames, 1.0f0)
+    Float32(dec / max(ctc_pf, 1f-8))
+end
 
 """CTC targets provided → add weighted CTC loss, normalized per-frame.
 
@@ -117,15 +145,18 @@ gradient to dominate the encoder and collapse to blank.
 
 We rescale to per-frame: divide by the average number of encoder frames so the
 CTC contribution is on the same scale as the decoder's per-token loss. This way
-`ctc_weight=0.5` actually means a ~50/50 split rather than CTC dominating."""
+`ctc_weight=0.5` is *roughly* a 50/50 split. The two losses are not guaranteed
+equal: decoder is mean CE per *token*, CTC is per *frame* (tokens and frames
+differ), and raw values can vary. Use `loss_balance` to scale CTC so that
+with weight 1 and 1 the two terms have equal typical magnitude."""
 function add_ctc_loss(loss, model::SpectrogramEncoderDecoder, enc_mem,
                       ctc_targets::Vector{Vector{Int}}, input_lengths::Vector{Int},
-                      ctc_weight::Real)
+                      ctc_weight::Real; loss_balance::Real = 1.0)
     logits = model.ctc_head(enc_mem)
     ctc_raw = CTCLoss.ctc_loss_batched(logits, ctc_targets, input_lengths, CTC_BLANK_IDX)
-    # Rescale from per-sample to per-frame to match decoder per-token CE scale
     avg_frames = Float32(sum(input_lengths)) / Float32(length(input_lengths))
-    loss + ctc_weight * (ctc_raw / max(avg_frames, 1.0f0))
+    ctc_per_frame = ctc_raw / max(avg_frames, 1.0f0)
+    loss + ctc_weight * Float32(loss_balance) * ctc_per_frame
 end
 
 # ─── Training step ───────────────────────────────────────────────────────────
@@ -137,6 +168,14 @@ Single training step with continuation-aware loss masking.
 `loss_mask` is (seq, batch) Float32 — 1.0 at positions where loss is computed.
 Prefix positions have 0.0 so the model is teacher-forced on context but not
 penalized for "predicting" known prefix tokens.
+
+Optional `decoder_scale` multiplies the decoder CE loss (e.g. 0.3 in phase 1 of
+a curriculum so CTC dominates; 1.0 in phase 2).
+
+Optional `loss_balance`: scale factor for the CTC term so that (decoder_scale * CE)
+and (ctc_weight * loss_balance * ctc_per_frame) have comparable magnitude when
+both weights are 1. Typically set to (decoder_loss / ctc_per_frame) from a
+calibration batch.
 """
 function train_step(
     model::SpectrogramEncoderDecoder,
@@ -147,10 +186,12 @@ function train_step(
     ctc_targets = nothing,
     input_lengths = nothing,
     ctc_weight::AbstractFloat = 0.0f0,
+    decoder_scale::AbstractFloat = 1.0f0,
     label_smoothing::AbstractFloat = 0.0f0,
+    loss_balance::Real = 1.0,
 )
     enc_mem, dec_mem = encode(model, spec)
     logits = model.decoder(decoder_input, dec_mem)
-    loss = sequence_cross_entropy(logits, decoder_target, loss_mask; label_smoothing)
-    add_ctc_loss(loss, model, enc_mem, ctc_targets, input_lengths, ctc_weight)
+    loss = decoder_scale * sequence_cross_entropy(logits, decoder_target, loss_mask; label_smoothing)
+    add_ctc_loss(loss, model, enc_mem, ctc_targets, input_lengths, ctc_weight; loss_balance)
 end

@@ -85,7 +85,7 @@ export
 
     # Training
     prepare_decoder_batch, prepare_training_batch, train_step,
-    prepare_ctc_targets,
+    prepare_ctc_targets, loss_balance_scale,
 
     # Decoding
     decode_autoregressive, decode_conversation,
