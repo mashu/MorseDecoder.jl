@@ -14,6 +14,8 @@ using Onion
 using Onion: TransformerBlock, RoPE, RMSNorm
 using Einops: rearrange, @einops_str
 using Random
+using ChainRulesCore
+using Zygote
 
 # ─── CW front-end (CWFeatureExtractor) ─────────────────────────────────────
 #
@@ -115,6 +117,46 @@ function (enc::SpectrogramEncoder)(spec::AbstractArray{T,3}) where T
     enc.norm(h)
 end
 
+# ─── Cross-attention encoder RoPE wrapper ─────────────────────────────────────
+#
+# Independent RoPE: Q uses decoder positions, K uses encoder positions. Passing two
+# RoPE slices (different lengths) as rope and krope makes Zygote accumulate their
+# gradients into the same structure → DimensionMismatch. Wrapping the encoder RoPE
+# in a distinct type keeps gradients separate: rope → dec.rope, krope → dec.rope_cross.
+
+"""Wrapper around RoPE used only for K in cross-attention (encoder positions). Callable like RoPE."""
+struct CrossEncoderRoPE{R}
+    rope::R
+end
+
+(w::CrossEncoderRoPE)(x) = w.rope(x)
+
+function ChainRulesCore.rrule(::Type{CrossEncoderRoPE}, rope)
+    w = CrossEncoderRoPE(rope)
+    function back(Δ)
+        Δ isa ChainRulesCore.Tangent && return (ChainRulesCore.NoTangent(), Δ.rope)
+        return (ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent())
+    end
+    return w, back
+end
+
+# (w::CrossEncoderRoPE)(x) is called by Onion Attention as krope(k). We use NoTangent() for the
+# wrapper so Zygote never tries to accum a decoder RoPE gradient with an encoder RoPE gradient
+# (which would be DimensionMismatch). Encoder positions are still applied in the forward (Independent
+# RoPE). (Onion RoPE has trainable=() so neither decoder nor encoder RoPE is trained; this is only
+# to fix the backward.)
+Zygote.@adjoint function (w::CrossEncoderRoPE)(x)
+    y = w.rope(x)
+    _, back_rope = Zygote.pullback(w.rope, x)
+    function back(dy)
+        grads = back_rope(dy)
+        d_x = length(grads) >= 1 ? grads[1] : nothing
+        # Don't pass gradient to w.rope so no accum with decoder RoPE
+        return (ChainRulesCore.NoTangent(), d_x)
+    end
+    return y, back
+end
+
 # ─── Decoder (causal self-attn + cross-attn) ──────────────────────────────────
 
 """
@@ -134,7 +176,8 @@ struct SpectrogramDecoder{E,D,SB,CB,N,H,R}
     cross_blocks::CB
     norm::N
     head::H
-    rope::R
+    rope::R           # decoder positions (self-attn + Q in cross-attn)
+    rope_cross::R      # encoder positions (K in cross-attn); separate param so grads don't merge
     self_attn_residual_scale::Float32
 end
 
@@ -164,27 +207,30 @@ function SpectrogramDecoder(
     norm = RMSNorm(dim; eps=norm_eps)
     head = Dense(dim => vocab_size)
     rope = RoPE(dim ÷ n_heads, max_len)
-    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope, Float32(self_attn_residual_scale))
+    rope_cross = RoPE(dim ÷ n_heads, max_len)
+    SpectrogramDecoder(embed, embed_dropout, self_blocks, cross_blocks, norm, head, rope, rope_cross, Float32(self_attn_residual_scale))
 end
 
 function (dec::SpectrogramDecoder)(decoder_input_ids::AbstractArray{<:Integer,2}, memory::AbstractArray{T,3}) where T
     h = dec.embed(decoder_input_ids)
     h = dec.embed_dropout(h)
     seq_len = size(h, 2)
+    T_enc = size(memory, 2)
     rope_dec = dec.rope[1:seq_len]
-    # Cross-attn: RoPE on q only. Use identity for krope so Zygote does not accum two
-    # different-length RoPE gradients (dec vs enc) in Onion's Attention pullback.
+    # Independent RoPE: Q with decoder positions, K with encoder positions. CrossEncoderRoPE
+    # wraps encoder RoPE so Zygote accumulates its gradient separately from decoder RoPE.
+    rope_enc = CrossEncoderRoPE(dec.rope_cross[1:T_enc])
     n_self = length(dec.self_blocks)
     scale = dec.self_attn_residual_scale
     for i in 1:n_self
         h_prev = h
         h = dec.self_blocks[i](h; rope=rope_dec, krope=rope_dec, causal=true)
         h = h_prev .+ scale .* (h .- h_prev)
-        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=identity)
+        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=rope_enc)
     end
     # Extra cross-only layers (n_cross_layers > n_decoder_layers)
     for i in (n_self + 1):length(dec.cross_blocks)
-        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=identity)
+        h = dec.cross_blocks[i](h, memory, memory; rope=rope_dec, krope=rope_enc)
     end
     dec.head(dec.norm(h))
 end
